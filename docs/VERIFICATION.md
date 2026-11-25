@@ -13,6 +13,8 @@
 | 未认证网关请求拒绝；非管理员拒绝 | 通过 | 通过 |
 | 本地 Unix Socket 返回真实 HTML 与 JS/CSS，而不是 fnOS 的 `invalid token` 占位响应 | 通过 | 通过 |
 | 网页资源路径保持在各自 `/app/…/` 前缀 | 通过 | 通过 |
+| 实际 nginx/www-data 用户可连接安装后的 Unix Socket | 通过 | 通过 |
+| 安装实例本地账户登录、认证态读取及退出 | 未新建用户测试 | 通过；Cookie 为 Secure/HttpOnly/SameSite=Lax 且限定应用路径 |
 | 运行时不启动 Docker 容器 | 通过 | 通过 |
 | 本地真实 WASM magic / MIME / 加载 | 不适用 | 通过 |
 | COOP / COEP 响应头 | 非该实现的必要条件 | 通过 |
