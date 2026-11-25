@@ -30,6 +30,8 @@ chmod +x build.sh package/cmd/*
 
 `bundle-native.py` 打包本机 PG15.15 的二进制、扩展、share 和依赖库闭包，布局可迁移；FFmpeg 使用 Debian 官方 **5.1.9** `.deb`，不复制 fnOS 自带的 nonfree mediasrv FFmpeg。PG/FFmpeg 的动态库来自当前 Debian12 主机，清单和 SHA256 在包内 `licenses/BUNDLE-INVENTORY.json`。同名库优先 `/lib/x86_64-linux-gnu`，不复制专有 GPU 驱动。
 
+**公开二进制暂缓**：后续审查发现初始构建在 fnOS 限制 `dpkg-query` 权限时会漏收动态库版权告知。收集器现已改为失败即退出，并仅在必要时尝试 `sudo -n dpkg-query` 只读查询。若系统已裁剪相应 `/usr/share/doc/<package>/copyright`（当前测试机的 `libstdc++6` 即存在此情况），构建会明确失败；请在拥有精确版本完整 notices 的隔离 Debian12 构建环境处理，不要跳过验证，也不要为此擅自升级 NAS 系统。完整依赖对应源码仍需继续整理，见 [发布审查](../docs/PSRP-LICENSE-REVIEW.md)。本机已安装的预览程序仍可用于功能测试，但这不等于已满足公开分发门槛。
+
 ### 可复现的范围与系统依赖
 
 包装脚本、上游 revision、npm lockfile、SDK 版本固定；**不是跨任意 Linux 的完全静态包或字节级 reproducible build**。PG、FFmpeg 依赖库随构建机 Debian12 补丁版本变化，应保存 inventory；不打包 glibc/ELF loader，要求 x86_64 Debian12 兼容 glibc >=2.36、libm、基础 NSS/时区/locale/CA 和 fnOS ACL 工具。原生 .NET 的系统 ICU/OpenSSL/Kerberos 等须与 Debian12 兼容。本机真实启动已验证。其他 fnOS 版本需安装回归，不应宣称已通用兼容。

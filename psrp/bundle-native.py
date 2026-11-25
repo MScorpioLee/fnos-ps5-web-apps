@@ -17,12 +17,26 @@ def libs(binary,dest):
    if path in seen_libraries:continue
    seen_libraries.add(path)
    # Preserve the copyright for each bundled Debian dependency.
-   q=subprocess.run(['dpkg-query','-S',str(Path(path).resolve())],capture_output=True,text=True)
-   if q.returncode:
-    q=subprocess.run(['dpkg-query','-S',str(path)],capture_output=True,text=True)
+   # Keep the build fail-closed: fnOS may restrict the dpkg database to root.
+   # Optional sudo here is read-only metadata access, never package installation.
+   q=None
+   for candidate in dict.fromkeys([str(Path(path).resolve()),str(path)]):
+    for prefix in ([],['sudo','-n']):
+     result=subprocess.run(prefix+['dpkg-query','-S',candidate],capture_output=True,text=True)
+     if result.returncode==0 and result.stdout.strip():
+      q=result
+      break
+    if q is not None:break
+   if q is None:
+    raise RuntimeError('Cannot determine Debian copyright owner for bundled dependency: '+path)
+   copied=False
    for line in q.stdout.splitlines():
     pkg=line.split(': ')[0].split(':')[0]; notice=Path('/usr/share/doc')/pkg/'copyright'
-    if notice.exists():copy(notice,app/'licenses'/('debian-'+pkg+'-copyright'))
+    if notice.exists():
+     copy(notice,app/'licenses'/('debian-'+pkg+'-copyright'))
+     copied=True
+   if not copied:
+    raise RuntimeError('Missing copyright notice for bundled dependency: '+path)
 pg=app/'pg'
 shutil.copytree('/usr/lib/postgresql/15',pg/'lib/postgresql/15',dirs_exist_ok=True)
 shutil.copytree('/usr/share/postgresql/15',pg/'share/postgresql/15',dirs_exist_ok=True)
