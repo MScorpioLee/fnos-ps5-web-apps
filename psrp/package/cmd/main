@@ -1,0 +1,17 @@
+#!/bin/sh
+set -eu
+umask 077
+: "${TRIM_APPDEST:?}" "${TRIM_PKGVAR:?}"
+NODE=/var/apps/nodejs_v22/target/bin/node
+if [ ! -x "$NODE" ]; then
+ printf '%s\n' 'Missing fnOS nodejs_v22 runtime' >&2
+ exit 1
+fi
+case "${1:-}" in
+ start|stop|status)
+   mkdir -p "$TRIM_PKGVAR"
+   exec 9>"$TRIM_PKGVAR/lifecycle.lock"
+   /usr/bin/flock -x 9
+   exec "$NODE" "$TRIM_APPDEST/service.mjs" "$1" ;;
+ *) exit 1 ;;
+esac

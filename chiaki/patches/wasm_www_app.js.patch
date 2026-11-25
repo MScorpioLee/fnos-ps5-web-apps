@@ -1,0 +1,198 @@
+--- a/wasm/www/app.js
++++ b/wasm/www/app.js
+@@ -768,7 +768,7 @@
+ async function pushCloudState() {
+ 	if (!cloud.authEnabled) return true;
+ 	const gen = stateGen;
+-	const { ok, body } = await cloudRequest("/api/state", {
++	const { ok, body } = await cloudRequest("/app/chiaki-ng-web/api/state", {
+ 		method: "PUT",
+ 		body: JSON.stringify(snapshotState())
+ 	});
+@@ -973,14 +973,14 @@
+ }
+ 
+ function shareLinkUrl() {
+-	return share.token ? `${location.origin}/#share=${share.token}` : "";
++	return share.token ? `${location.origin}/app/chiaki-ng-web/#share=${share.token}` : "";
+ }
+ 
+ function shareWsUrl(token) {
+ 	const proto = location.protocol === "https:" ? "wss" : "ws";
+ 	return token
+-		? `${proto}://${location.host}/share-sig?token=${encodeURIComponent(token)}`
+-		: `${proto}://${location.host}/share-sig`;
++		? `${proto}://${location.host}/app/chiaki-ng-web/share-sig?token=${encodeURIComponent(token)}`
++		: `${proto}://${location.host}/app/chiaki-ng-web/share-sig`;
+ }
+ 
+ function shareSend(obj) {
+@@ -2009,7 +2009,7 @@
+ 
+ async function loadShareState() {
+ 	if (share.isGuest || isElectronApp()) return;
+-	const { ok, body } = await cloudRequest("/api/share");
++	const { ok, body } = await cloudRequest("/app/chiaki-ng-web/api/share");
+ 	if (!ok) return;
+ 	applyShareData(body);
+ 	if (share.active) shareConnectHost();
+@@ -2019,7 +2019,7 @@
+ async function saveShare(extra) {
+ 	showShareError("");
+ 	const body = { ...shareRightsFromForm(), active: share.active, ...(extra || {}) };
+-	const { ok, body: out } = await cloudRequest("/api/share", {
++	const { ok, body: out } = await cloudRequest("/app/chiaki-ng-web/api/share", {
+ 		method: "POST",
+ 		body: JSON.stringify(body)
+ 	});
+@@ -2532,7 +2532,7 @@
+ 	share.isGuest = true;
+ 	share.token = token;
+ 	document.body.classList.add("share-guest");
+-	const { ok, body } = await cloudRequest("/api/share/join?token=" + encodeURIComponent(token));
++	const { ok, body } = await cloudRequest("/app/chiaki-ng-web/api/share/join?token=" + encodeURIComponent(token));
+ 	if (!ok) {
+ 		setBootScreen(false);
+ 		alert(t("share.missing"));
+@@ -2689,7 +2689,7 @@
+ 
+ async function pullCloudState() {
+ 	if (!cloud.authEnabled) return true;
+-	const { ok, status, body } = await cloudRequest("/api/state");
++	const { ok, status, body } = await cloudRequest("/app/chiaki-ng-web/api/state");
+ 	if (status === 401) return false;
+ 	if (!ok) return true;
+ 	applyRemoteState(body);
+@@ -2733,8 +2733,8 @@
+ 	}
+ 	box.innerHTML = "";
+ 	for (const it of [
+-		{ id: "windows", className: "proxy-dl-win", label: "config.proxyDlWin", fallback: "/downloads/chiaki-proxy-windows.exe" },
+-		{ id: "linux", className: "proxy-dl-win", label: "config.proxyDlLinux", fallback: "/downloads/chiaki-proxy-linux" },
++		{ id: "windows", className: "proxy-dl-win", label: "config.proxyDlWin", fallback: null },
++		{ id: "linux", className: "proxy-dl-win", label: "config.proxyDlLinux", fallback: null },
+ 		{ id: "macos", className: "ghost", label: "config.proxyDlMac", fallback: null }
+ 	]) {
+ 		const href = (proxyBuilds && proxyBuilds[it.id]) || it.fallback;
+@@ -2752,7 +2752,7 @@
+ 
+ async function loadProxyDownloads() {
+ 	try {
+-		const { ok, body } = await cloudRequest("/api/proxy-builds");
++		const { ok, body } = await cloudRequest("/app/chiaki-ng-web/api/proxy-builds");
+ 		if (ok && body && typeof body === "object") proxyBuilds = body;
+ 	} catch {}
+ 	renderProxyDownloads();
+@@ -2806,21 +2806,21 @@
+ }
+ 
+ async function approveHomeProxy() {
+-	const { ok, body } = await cloudRequest("/api/proxy/approve", { method: "POST", body: "{}" });
++	const { ok, body } = await cloudRequest("/app/chiaki-ng-web/api/proxy/approve", { method: "POST", body: "{}" });
+ 	if (!ok) return;
+ 	applyCloudMeta(body);
+ 	location.reload();
+ }
+ 
+ async function disconnectHomeProxy() {
+-	const { ok, body } = await cloudRequest("/api/proxy/disconnect", { method: "POST", body: "{}" });
++	const { ok, body } = await cloudRequest("/app/chiaki-ng-web/api/proxy/disconnect", { method: "POST", body: "{}" });
+ 	if (ok) applyCloudMeta(body);
+ 	$("home-proxy-modal")?.classList.add("hidden");
+ 	location.reload();
+ }
+ 
+ async function rejectHomeProxy() {
+-	const { ok, body } = await cloudRequest("/api/proxy/reject", { method: "POST", body: "{}" });
++	const { ok, body } = await cloudRequest("/app/chiaki-ng-web/api/proxy/reject", { method: "POST", body: "{}" });
+ 	if (ok) applyCloudMeta(body);
+ 	$("home-proxy-modal")?.classList.add("hidden");
+ 	ensureWasmRuntime().catch(() => {});
+@@ -2828,7 +2828,7 @@
+ 
+ async function initCloud() {
+ 	try {
+-		const { ok, body } = await cloudRequest("/api/meta");
++		const { ok, body } = await cloudRequest("/app/chiaki-ng-web/api/meta");
+ 		if (ok) applyCloudMeta(body);
+ 	} catch {}
+ 	await waitForAuthIfNeeded();
+@@ -2837,13 +2837,13 @@
+ 	}
+ 	if (homeProxyUiEnabled()) {
+ 		try {
+-			const { ok, body } = await cloudRequest("/api/meta");
++			const { ok, body } = await cloudRequest("/app/chiaki-ng-web/api/meta");
+ 			if (ok) applyCloudMeta(body);
+ 		} catch {}
+ 		if (!homeProxyWatch) {
+ 			homeProxyWatch = setInterval(async () => {
+ 				try {
+-					const { ok, body } = await cloudRequest("/api/meta");
++					const { ok, body } = await cloudRequest("/app/chiaki-ng-web/api/meta");
+ 					if (ok) applyCloudMeta(body);
+ 				} catch {}
+ 			}, 1500);
+@@ -2857,7 +2857,7 @@
+ 	const email = ((register ? $("auth-reg-email") : $("auth-email"))?.value || "").trim();
+ 	const password = (register ? $("auth-reg-pass") : $("auth-pass"))?.value || "";
+ 	const username = ($("auth-reg-name")?.value || "").trim();
+-	const url = register ? "/api/register" : "/api/login";
++	const url = register ? "/app/chiaki-ng-web/api/register" : "/app/chiaki-ng-web/api/login";
+ 	const { ok, body } = await cloudRequest(url, {
+ 		method: "POST",
+ 		body: JSON.stringify(register ? { username, email, password } : { email, password })
+@@ -2883,7 +2883,7 @@
+ }
+ function defaultProxyUrl() {
+ 	const proto = location.protocol === "https:" ? "wss" : "ws";
+-	return `${proto}://${location.host}/posix-net`;
++	return `${proto}://${location.host}/app/chiaki-ng-web/posix-net`;
+ }
+ 
+ function effectiveProxyUrl() {
+@@ -5951,7 +5951,7 @@
+ 	out.classList.remove("hidden");
+ 	out.innerHTML = `<p class="portcheck-sum">${escapeHtml(t("add.portcheckRun"))}</p>`;
+ 	try {
+-		const { ok, body } = await cloudRequest("/api/portcheck", {
++		const { ok, body } = await cloudRequest("/app/chiaki-ng-web/api/portcheck", {
+ 			method: "POST",
+ 			body: JSON.stringify({ host }),
+ 			timeoutMs: 12000
+@@ -6217,7 +6217,7 @@
+ 			return;
+ 		}
+ 		showAccountError("");
+-		const { ok, body } = await cloudRequest("/api/account", {
++		const { ok, body } = await cloudRequest("/app/chiaki-ng-web/api/account", {
+ 			method: "POST",
+ 			body: JSON.stringify({
+ 				username,
+@@ -6257,7 +6257,7 @@
+ 			return;
+ 		}
+ 		showDeleteAccountError("");
+-		const { ok, body } = await cloudRequest("/api/account/delete", {
++		const { ok, body } = await cloudRequest("/app/chiaki-ng-web/api/account/delete", {
+ 			method: "POST",
+ 			body: JSON.stringify({ currentPassword })
+ 		});
+@@ -6271,7 +6271,7 @@
+ 	};
+ 	$("btn-logout").onclick = async () => {
+ 		closeAccountMenu();
+-		await cloudRequest("/api/logout", { method: "POST" });
++		await cloudRequest("/app/chiaki-ng-web/api/logout", { method: "POST" });
+ 		cloud.user = null;
+ 		clearLocalAccountData();
+ 		location.reload();
+@@ -6719,7 +6719,7 @@
+ 	bindModule();
+ 	try { $("app-version").textContent = api.version(); } catch {}
+ 	const proto = location.protocol === "https:" ? "wss" : "ws";
+-	proxyUrl = effectiveProxyUrl() || `${proto}://${location.host}/posix-net`;
++	proxyUrl = effectiveProxyUrl() || `${proto}://${location.host}/app/chiaki-ng-web/posix-net`;
+ 	proxyState = "";
+ 	refreshProxyStatus();
+ 	log("Init Chiaki WASM → " + proxyUrl);

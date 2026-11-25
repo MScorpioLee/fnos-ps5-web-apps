@@ -1,0 +1,3 @@
+#!/bin/sh
+# All persistent data are retained in TRIM_PKGVAR.
+exit 0

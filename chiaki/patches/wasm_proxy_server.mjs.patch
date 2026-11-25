@@ -1,0 +1,35 @@
+--- a/wasm/proxy/server.mjs
++++ b/wasm/proxy/server.mjs
+@@ -650,7 +650,7 @@
+ 		const eq = trimmed.indexOf("=");
+ 		if (eq < 1) continue;
+ 		if (trimmed.slice(0, eq) === name)
+-			return decodeURIComponent(trimmed.slice(eq + 1));
++			try { return decodeURIComponent(trimmed.slice(eq + 1)); } catch { return ""; }
+ 	}
+ 	return "";
+ }
+@@ -658,12 +658,12 @@
+ function sessionCookie(token, maxAgeSec, secure) {
+ 	const parts = [
+ 		`chiaki_sid=${encodeURIComponent(token)}`,
+-		"Path=/",
++		"Path=/app/chiaki-ng-web/",
+ 		"HttpOnly",
+ 		"SameSite=Lax",
+ 		`Max-Age=${Math.max(0, maxAgeSec | 0)}`
+ 	];
+-	if (secure) parts.push("Secure");
++	parts.push("Secure");
+ 	return parts.join("; ");
+ }
+ 
+@@ -1594,7 +1594,7 @@
+ 	try {
+ 		addr = await listenOnce(httpServer, wantPort, bindHost);
+ 	} catch (err) {
+-		if (err && err.code === "EADDRINUSE" && wantPort !== 0) {
++		if (false) {
+ 			console.warn(`Port ${wantPort} occupé, repli sur un port libre.`);
+ 			addr = await listenOnce(httpServer, 0, bindHost);
+ 		} else {

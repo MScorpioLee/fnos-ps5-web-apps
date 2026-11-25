@@ -1,0 +1,14 @@
+{
+  ".url": {
+    "psrp-web.main": {
+      "title": "PSRP Remote Play",
+      "icon": "images/icon_{0}.png",
+      "type": "url",
+      "protocol": "",
+      "gatewayPrefix": "/app/psrp-web",
+      "gatewaySocket": "app.sock",
+      "url": "/app/psrp-web/",
+      "allUsers": false
+    }
+  }
+}

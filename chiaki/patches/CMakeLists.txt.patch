@@ -1,0 +1,22 @@
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -173,7 +173,8 @@
+ 		set(MBEDTLS_FATAL_WARNINGS OFF CACHE BOOL "" FORCE)
+ 		FetchContent_Declare(
+ 			mbedtls
+-			GIT_REPOSITORY https://github.com/Mbed-TLS/mbedtls.git
++			SOURCE_DIR "${CMAKE_SOURCE_DIR}/../deps/mbedtls"
++            # GIT_REPOSITORY removed; pinned by SOURCES.json
+ 			GIT_TAG 8b3f26a5ac38d4fdccbc5c5366229f3e01dafcc0 # v2.28.0
+ 			GIT_PROGRESS TRUE
+ 		)
+@@ -194,7 +195,8 @@
+ 	set(OPUS_INSTALL_CMAKE_CONFIG_MODULE OFF CACHE BOOL "" FORCE)
+ 	FetchContent_Declare(
+ 		opus
+-		GIT_REPOSITORY https://github.com/xiph/opus.git
++		SOURCE_DIR "${CMAKE_SOURCE_DIR}/../deps/opus"
++        # GIT_REPOSITORY removed; pinned by SOURCES.json
+ 		GIT_TAG v1.5.2
+ 		GIT_SHALLOW TRUE
+ 	)

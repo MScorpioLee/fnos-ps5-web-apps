@@ -1,0 +1,3 @@
+#!/bin/sh
+# fnOS stops the package before replacing binaries; data are retained.
+exit 0

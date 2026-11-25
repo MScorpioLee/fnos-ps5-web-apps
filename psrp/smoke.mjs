@@ -1,0 +1,23 @@
+import http from 'node:http';import net from 'node:net';import crypto from 'node:crypto';import fs from 'node:fs';import path from 'node:path';import {spawnSync}from'node:child_process';
+const A=process.env.TRIM_APPDEST,V=process.env.TRIM_PKGVAR; const base='/app/psrp-web',sock=path.join(A,'app.sock');
+function assert(x,m){if(!x)throw Error(m);console.log('PASS '+m)}
+function request(url,method='GET',body=null,auth=true,token=null){return new Promise((resolve,reject)=>{let data=body?JSON.stringify(body):null;let headers=auth?{'x-trim-userid':'smoke-admin','x-trim-isadmin':'true'}:{};if(data){headers['content-type']='application/json';headers['content-length']=Buffer.byteLength(data)}if(token)headers.authorization='Bearer '+token;const q=http.request({socketPath:sock,path:base+url,method,headers},r=>{let b='';r.on('data',c=>b+=c);r.on('end',()=>resolve({status:r.statusCode,body:b,headers:r.headers,json:()=>JSON.parse(b)}))});q.on('error',reject);q.end(data)})}
+function websocket(hub,token){return new Promise((resolve,reject)=>{
+ const s=net.connect(sock);let data=Buffer.alloc(0),upgraded=false;const timer=setTimeout(()=>{s.destroy();reject(Error('WS timeout '+hub))},5000);
+ s.on('connect',()=>s.write(`GET ${base}/hubs/${hub}?access_token=${token} HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: ${crypto.randomBytes(16).toString('base64')}\r\nX-Trim-Userid: smoke-admin\r\nX-Trim-Isadmin: true\r\n\r\n`));
+ s.on('error',reject);s.on('data',chunk=>{data=Buffer.concat([data,chunk]);if(!upgraded){let i=data.indexOf('\r\n\r\n');if(i<0)return;assert(data.subarray(0,i).toString().includes('101 Switching Protocols'),hub+' WebSocket upgraded');data=data.subarray(i+4);upgraded=true;const p=Buffer.from('{"protocol":"json","version":1}\x1e'),m=crypto.randomBytes(4),f=Buffer.alloc(6+p.length);f[0]=0x81;f[1]=0x80|p.length;m.copy(f,2);for(let j=0;j<p.length;j++)f[6+j]=p[j]^m[j%4];s.write(f)}if(upgraded&&data.length>=5){assert(data.includes(Buffer.from('{}\x1e')),hub+' SignalR JSON handshake');clearTimeout(timer);s.destroy();resolve()}})
+})}
+let r=await request('/', 'GET',null,false);assert(r.status===403,'anonymous Unix gateway denied');
+r=await request('/');assert(r.status===200&&r.headers['content-type'].startsWith('text/html')&&r.body.includes('type="module"'),'React HTML served (not invalid token)');assert(r.body.includes('/app/psrp-web/assets/'),'frontend asset base');
+r=await request('/devices');assert(r.body.includes('type="module"'),'SPA deep link');
+r=await request('/manifest.webmanifest');assert(r.json().start_url===base+'/','PWA scoped base');
+r=await request('/healthz');assert(r.json().status==='ok','native .NET health');
+r=await request('/api/auth/me');assert((r.status===401)||(r.status===200&&r.json().success===false&&r.json().Type==='401'),'backend JWT authorization denied anonymous (upstream JSON error envelope)');
+const username='smoke_'+crypto.randomBytes(5).toString('hex'),password=crypto.randomBytes(24).toString('hex');
+r=await request('/api/auth/register','POST',{username,email:username+'@example.invalid',password});assert(r.status===200&&r.json().success,'database-backed registration with migrated schema');
+r=await request('/api/auth/login','POST',{usernameOrEmail:username,password});assert(r.status===200&&r.json().success,'password login');const auth=r.json().data;const token=auth.token||auth.accessToken;if(!token)throw Error('Missing token; fields '+Object.keys(auth));
+r=await request('/api/auth/me','GET',null,true,token);assert(r.status===200&&r.json().data.username===username,'authenticated user persisted in private PostgreSQL');
+for(const hub of ['controller','streaming','device-status']){r=await request('/hubs/'+hub+'/negotiate?negotiateVersion=1','POST',null,true,token);assert(r.status===200&&r.json().availableTransports.some(x=>x.transport==='WebSockets'),hub+' prefixed negotiation');await websocket(hub,token)}
+assert((fs.statSync(path.join(V,'secrets.json')).mode&0o777)===0o600,'random credentials mode 0600');
+const pg=spawnSync(path.join(A,'pg/lib/postgresql/15/bin/psql'),['-h','127.0.0.1','-p','10112','-U','psrp','-d','psrp','-Atc','SELECT count(*) FROM "__EFMigrationsHistory"'],{env:{...process.env,LD_LIBRARY_PATH:path.join(A,'pg/deps'),PGPASSWORD:JSON.parse(fs.readFileSync(path.join(V,'secrets.json'))).database},encoding:'utf8'});assert(pg.status===0&&Number(pg.stdout.trim())>=4,'four EF migrations applied to isolated cluster');
+console.log('NOT TESTED: fnOS installed gateway login, real PS5 pairing/PIN, video/audio/gamepad. No streaming success claimed.');

@@ -1,0 +1,35 @@
+name: Packaging source checks
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  source-checks:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Unit tests for publish safety checks
+        run: python3 -m unittest discover -s tools -p 'test_*.py'
+      - name: Check tracked source for credentials and runtime artifacts
+        run: python3 tools/check-publish.py .
+      - name: Validate shell syntax
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import subprocess
+          for path in Path('.').rglob('*'):
+              if not path.is_file() or '.git' in path.parts:
+                  continue
+              try:
+                  first = path.open('rb').readline(200)
+              except OSError:
+                  continue
+              if first.startswith((b'#!/bin/bash', b'#!/usr/bin/env bash', b'#!/bin/sh')):
+                  subprocess.run(['bash', '-n', str(path)], check=True)
+          PY

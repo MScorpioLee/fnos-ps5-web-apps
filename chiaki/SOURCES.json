@@ -1,0 +1,38 @@
+[
+  {
+    "repo": "CSystem77/Chiaki-NG-Web",
+    "revision": "70669b47a16376768001db229e3e8c3baf3e5238",
+    "path": "source",
+    "sha256": "8d65aa503fbc622d6dfb99adcb3294f72740aff90a7e958cb5a64557752ad3ac"
+  },
+  {
+    "repo": "nanopb/nanopb",
+    "revision": "e9e6eb5b4b57c69afe6161094e3996e322701e87",
+    "path": "source/third-party/nanopb",
+    "sha256": "502198a4144aa1f12a27d60b94daced8b3574fdeeb28224793aa0e6f9cd32f67"
+  },
+  {
+    "repo": "streetpea/jerasure",
+    "revision": "505ccb4bc69eee8d7ea40a6089a056b99671134f",
+    "path": "source/third-party/jerasure",
+    "sha256": "d9526bf52f338ee78ba6ba733fafc0321719344debd32e0746f437dd56a4fe43"
+  },
+  {
+    "repo": "streetpea/gf-complete",
+    "revision": "fa54a4670a5705c84abf6c24b92b0cd479625478",
+    "path": "source/third-party/gf-complete",
+    "sha256": "32937a9e949392b149e4a025901f5104d4a7ec9827887d6f4e1e70d583688f6f"
+  },
+  {
+    "repo": "Mbed-TLS/mbedtls",
+    "revision": "8b3f26a5ac38d4fdccbc5c5366229f3e01dafcc0",
+    "path": "deps/mbedtls",
+    "sha256": "f16ba9cdec40b3063854962c870f7ab6b05ff9666f0acb5965ebcb163443e998"
+  },
+  {
+    "repo": "xiph/opus",
+    "revision": "v1.5.2",
+    "path": "deps/opus",
+    "sha256": "9480e329e989f70d69886ded470c7f8cfe6c0667cc4196d4837ac9e668fb7404"
+  }
+]

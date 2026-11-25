@@ -1,0 +1,10 @@
+--- a/wasm/www/index.html
++++ b/wasm/www/index.html
+@@ -13,6 +13,7 @@
+ 	<link rel="stylesheet" href="style.css">
+ </head>
+ <body>
++<a href="https://github.com/MScorpioLee/fnos-ps5-web-apps" target="_blank" rel="noopener" style="position:fixed;bottom:4px;right:8px;z-index:9999;font:11px sans-serif;color:#aaa">Source / AGPL-3.0</a>
+ 	<div id="boot-screen" class="boot-screen">
+ 		<img src="icons/chiaking-logo.svg" alt="">
+ 		<p id="boot-msg" data-i18n="boot.loading">Chargement…</p>

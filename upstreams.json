@@ -1,0 +1,14 @@
+{
+  "psrp": {
+    "repository": "https://github.com/o1298098/remote-play",
+    "revision": "24138d79f9fec10165d3dce9eebe95bc18ea5fa0",
+    "license": "MIT",
+    "application_id": "psrp-web"
+  },
+  "chiaki": {
+    "repository": "https://github.com/CSystem77/Chiaki-NG-Web",
+    "revision": "70669b47a16376768001db229e3e8c3baf3e5238",
+    "license": "See upstream COPYING and component notices",
+    "application_id": "chiaki-ng-web"
+  }
+}

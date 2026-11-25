@@ -1,0 +1,25 @@
+# Generated upstream source, build cache and runtime secrets are not source-control material.
+/source/
+/Chiaki-NG-Web-*/
+/deps/
+/archives/
+/tools/
+/package/
+/runtime/
+/test-runtime/
+/upstream.tar.gz
+*.fpk
+*.tar.gz
+*.wasm
+*.wasm.map
+*.sqlite*
+credentials.json
+*.pem
+*.key
+__pycache__/
+/official-*.html
+/official-*.txt
+/logs-tools.log
+/third-party-page.html
+/upstream-tree.json
+/logs/
