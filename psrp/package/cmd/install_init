@@ -1,3 +1,15 @@
 #!/bin/sh
-# All persistent data are retained in TRIM_PKGVAR.
-exit 0
+set -eu
+umask 077
+: "${TRIM_APPDEST:?}" "${TRIM_PKGVAR:?}"
+# No shell tracing and no secret arguments. Same lock serializes installation callbacks.
+mkdir -p "$TRIM_PKGVAR"
+exec 9>"$TRIM_PKGVAR/lifecycle.lock"
+/usr/bin/flock -x 9
+if ! /var/apps/nodejs_v22/target/bin/node "$(dirname -- "$0")/settings.mjs" validate psrp; then
+ if [ -n "${TRIM_TEMP_LOGFILE:-}" ]; then
+  printf '%s
+' '安装设置无效：请核对账户、16–128位混合密码及确认、可用独立HTTP端口（1024–65535）。已有数据不重置。' >"$TRIM_TEMP_LOGFILE"
+ fi
+ exit 1
+fi

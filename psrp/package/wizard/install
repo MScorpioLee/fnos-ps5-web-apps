@@ -1,0 +1,78 @@
+[
+  {
+    "stepTitle": "PS网页串流 (PS remote web) — 本地账户",
+    "items": [
+      {
+        "type": "tips",
+        "helpText": "这是应用本地登录账户，不是飞牛管理员密码或 PSN 账户/PS5 配对码。入口仍须飞牛管理员会话。密码须16–128位，含大小写字母、数字及符号；确认一致由安装脚本校验。已有账户/数据在重装或升级时保留，不重置。PSRP上游无单独管理员角色，此账户受NAS管理员网关保护。"
+      },
+      {
+        "type": "text",
+        "field": "wizard_admin_user",
+        "label": "本地账户名",
+        "initValue": "admin",
+        "rules": [
+          {
+            "required": true,
+            "message": "请填写此项"
+          },
+          {
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{2,49}$",
+            "message": "请检查输入格式"
+          }
+        ]
+      },
+      {
+        "type": "password",
+        "field": "wizard_admin_password",
+        "label": "本地账户密码",
+        "rules": [
+          {
+            "required": true,
+            "message": "请填写此项"
+          }
+        ]
+      },
+      {
+        "type": "password",
+        "field": "wizard_admin_confirm",
+        "label": "确认密码",
+        "rules": [
+          {
+            "required": true,
+            "message": "请填写此项"
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "stepTitle": "HTTPS网关与端口",
+    "items": [
+      {
+        "type": "tips",
+        "helpText": "默认统一fnOS网关 /app/psrp-web/（Unix socket）保持不变，须NAS管理员会话及可信HTTPS。端口留空=仅网关；填写=另启仅127.0.0.1监听的HTTP网页入口，供同一NAS上的Lucky/nginx HTTPS反代。域名、证书及反代由用户自行配置，本向导不设置DDNS。独立入口不使用fnOS身份头，只使用应用自身登录；禁止注册，跨域写入/WebSocket拒绝。此端口不是UDP视频端口，不会自动开NAS防火墙、UPnP、DNS或公网路由映射。数据库保持内部，不开放。"
+      },
+      {
+        "type": "text",
+        "field": "wizard_http_port",
+        "label": "可选独立HTTP端口（仅回环，供反代）",
+        "initValue": "",
+        "rules": [
+          {
+            "pattern": "^[0-9]*$",
+            "message": "请检查输入格式"
+          }
+        ]
+      },
+      {
+        "type": "tips",
+        "helpText": "反代须保留/app/psrp-web/前缀及原始Host（含非标准HTTPS端口），覆盖X-Forwarded-Proto为https，转发WebSocket；写入和WebSocket的Origin须与https://Host完全一致。不能传客户端自带的代理头链，X-Forwarded-Host若存在须等于Host。TLS在反代终止，只能使用同机反代/host网络，其他主机或隔离容器不能直连回环端口。不支持任意basePath或站点根目录。独立入口不继承fnOS身份，X-Trim-*头不能绕过应用登录。"
+      },
+      {
+        "type": "tips",
+        "helpText": "网页经DDNS反代可达不等于视频可达：PSRP WebRTC媒体仍需独立ICE/STUN/TURN/NAT连通；HTTP端口不是媒体UDP端口。本向导不设置UDP范围，也不修改已有串流配置。Chiaki按上游relay/PS5协议通信。"
+      }
+    ]
+  }
+]

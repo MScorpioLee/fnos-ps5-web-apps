@@ -1,0 +1,2817 @@
+--- /dev/null
++++ b/RemotePlay.RegressionTests/BrowserLifetimeTests.cs
+@@ -0,0 +1,34 @@
++using System.Reflection;
++using System.Collections.Concurrent;
++using Microsoft.Extensions.DependencyInjection;
++using Microsoft.Extensions.Logging.Abstractions;
++using RemotePlay.Contracts.Services;
++using RemotePlay.Services.WebRTC;
++using RemotePlay.Services.Streaming.Receiver;
++using SIPSorcery.Net;
++
++static class BrowserLifetimeTests
++{
++    public static async Task RemovalKeepsConsole()
++    {
++        var proxy = DispatchProxy.Create<IStreamingService, StopCountingProxy>();
++        var services = new ServiceCollection().BuildServiceProvider();
++        var signaling = new WebRTCSignalingService(NullLogger<WebRTCSignalingService>.Instance, NullLoggerFactory.Instance, streamingService: proxy, serviceProvider: services);
++        using var peer = new RTCPeerConnection(new RTCConfiguration { iceServers = new() });
++        using var receiver = new WebRTCReceiver("browser", peer, NullLogger<WebRTCReceiver>.Instance);
++        var rtc = new WebRTCSession { SessionId = "browser", PeerConnection = peer, Receiver = receiver, StreamingSessionId = Guid.NewGuid() };
++        ((ConcurrentDictionary<string, WebRTCSession>)typeof(WebRTCSignalingService).GetField("_sessions", BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(signaling)!)["browser"] = rtc;
++        await signaling.RemoveSessionAsync("browser");
++        if (((StopCountingProxy)(object)proxy).Stops != 0) throw new Exception("Browser deletion immediately stopped PS5 instead of independent idle grace");
++    }
++}
++public class StopCountingProxy : DispatchProxy
++{
++    public int Stops;
++    protected override object? Invoke(MethodInfo? method, object?[]? args)
++    {
++        if (method!.Name == "StopStreamAsync") { Stops++; return Task.FromResult(true); }
++        if (method.Name == "GetStreamAsync") return Task.FromResult<RemotePlay.Services.Streaming.Core.RPStreamV2?>(null);
++        throw new NotSupportedException(method.Name);
++    }
++}
+--- /dev/null
++++ b/RemotePlay.RegressionTests/HarnessDb.cs
+@@ -0,0 +1,10 @@
++using Microsoft.EntityFrameworkCore;
++using RemotePlay.Models.Context;
++sealed class HarnessDb(DbContextOptions<RPContext> options) : RPContext(options)
++{
++    protected override void OnModelCreating(ModelBuilder b)
++    {
++        base.OnModelCreating(b);
++        b.Ignore<Newtonsoft.Json.Linq.JObject>();
++    }
++}
+--- /dev/null
++++ b/RemotePlay.RegressionTests/LifecycleBoundaryTests.cs
+@@ -0,0 +1,51 @@
++using Microsoft.AspNetCore.Authorization;
++using RemotePlay.Controllers;
++using RemotePlay.Hubs;
++using RemotePlay.Services.Lifecycle;
++using RemotePlay.Models.PlayStation;
++
++static class LifecycleBoundaryTests
++{
++    static void Check(bool v, string m) { if (!v) throw new Exception(m); }
++    public static Task AuthBoundaries()
++    {
++        foreach (var type in new[] { typeof(WebRTCController), typeof(PlayStationController), typeof(StreamingController), typeof(ControllerHub), typeof(StreamingHub) })
++            Check(type.GetCustomAttributes(typeof(AuthorizeAttribute), true).Length > 0, $"{type.Name} allows anonymous lifecycle/control");
++        return Task.CompletedTask;
++    }
++    public static Task ClockBoundaries()
++    {
++        var clock = new ManualClock(); var c = new SessionLifecycle(clock);
++        var s = new RemoteSession { HostId = "ps5" }; c.Register(s,"alice");
++        var a = c.Prepare(s.Id,"alice",null);
++        clock.Advance(59); Check(!c.Expired(s.Id), "initial lease expires before 60s");
++        clock.Advance(1); Check(c.Expired(s.Id), "unconnected offers leaked beyond 60s");
++        s = new RemoteSession { HostId = "other" }; c.Register(s,"alice");
++        a = c.Prepare(s.Id,"alice",null); c.SetConnected(s.Id,a.Token!,true); c.Commit(s.Id,"alice",a.Token!);
++        c.SetConnected(s.Id,a.Token!,false); clock.Advance(59);
++        c.SetConnected(s.Id,a.Token!,true); clock.Advance(1); Check(!c.Expired(s.Id), "59s reconnect failed to rescue console");
++        c.SetConnected(s.Id,a.Token!,false); clock.Advance(59);
++        c.SetConnected(s.Id,a.Token!,false); clock.Advance(1);
++        Check(c.Expired(s.Id), "duplicate old disconnected callback extended grace");
++        s = new RemoteSession { HostId = "replacement" }; c.Register(s,"alice");
++        a = c.Prepare(s.Id,"alice",null); c.SetConnected(s.Id,a.Token!,true); c.Commit(s.Id,"alice",a.Token!);
++        c.Release(s.Id,a.Token!); clock.Advance(59);
++        var conflict = c.Prepare(s.Id,"alice",null);
++        Check(conflict.Status == 409, "new browser skipped confirmation during grace");
++        var replacement = c.Prepare(s.Id,"alice",conflict.Generation);
++        c.SetConnected(s.Id,replacement.Token!,true);
++        Check(c.Commit(s.Id,"alice",replacement.Token!), "59s replacement could not commit");
++        clock.Advance(1); Check(!c.Expired(s.Id), "released-browser replacement did not rescue console at 59s");
++        var pending = c.Prepare(s.Id,"alice",replacement.Generation);
++        clock.Advance(60); c.SetConnected(s.Id,pending.Token!,true);
++        Check(!c.Commit(s.Id,"alice",pending.Token!), "expired pending lease was revived by a late connected callback");
++        Check(c.IsCurrent(s.Id,"alice",replacement.Token!), "expired pending lease disturbed the active controller");
++        return Task.CompletedTask;
++    }
++}
++sealed class ManualClock : TimeProvider
++{
++    DateTimeOffset now = DateTimeOffset.UnixEpoch;
++    public override DateTimeOffset GetUtcNow() => now;
++    public void Advance(int seconds) => now += TimeSpan.FromSeconds(seconds);
++}
+--- /dev/null
++++ b/RemotePlay.RegressionTests/LifecycleHttpHarness.cs
+@@ -0,0 +1,119 @@
++using System.Reflection;
++using System.Security.Claims;
++using System.Text.Encodings.Web;
++using Microsoft.AspNetCore.Authentication;
++using Microsoft.AspNetCore.DataProtection;
++using Microsoft.AspNetCore.Builder;
++using Microsoft.AspNetCore.Http;
++using Microsoft.AspNetCore.Hosting;
++using Microsoft.EntityFrameworkCore;
++using Microsoft.Extensions.DependencyInjection;
++using Microsoft.Extensions.Logging;
++using Microsoft.Extensions.Logging.Abstractions;
++using Microsoft.Extensions.Options;
++using RemotePlay.Contracts.Services;
++using RemotePlay.Controllers;
++using RemotePlay.Models.Context;
++using RemotePlay.Models.PlayStation;
++using RemotePlay.Services.Lifecycle;
++using RemotePlay.Services.WebRTC;
++using RemotePlay.Services.Streaming.Core;
++using RemotePlay.Services.RemotePlay;
++using SIPSorcery.Net;
++
++// Test-only executable host. No production configuration, credentials, discovery, or PS5 transports are loaded.
++static class LifecycleHttpHarness
++{
++    public static async Task Run(bool fresh = false)
++    {
++        var builder = WebApplication.CreateBuilder();
++        builder.WebHost.UseUrls("http://127.0.0.1:5188");
++        builder.Logging.SetMinimumLevel(LogLevel.Warning);
++        builder.Services.AddAuthentication("fixture").AddScheme<AuthenticationSchemeOptions, FixtureAuthentication>("fixture", _ => { });
++        builder.Services.AddDataProtection().UseEphemeralDataProtectionProvider();
++        builder.Services.AddAuthorization();
++        builder.Services.AddSingleton<LifecycleHubFilter>();
++        builder.Services.AddSignalR(o => Microsoft.AspNetCore.SignalR.HubOptionsExtensions.AddFilter<LifecycleHubFilter>(o));
++        builder.Services.AddScoped<RPContext>(_ => new HarnessDb(new DbContextOptionsBuilder<RPContext>().UseInMemoryDatabase("lifecycle-fixture").Options));
++        builder.Services.AddSingleton<SessionLifecycle>(); builder.Services.AddScoped<LifecycleAccess>(); builder.Services.AddScoped<LifecycleFilter>();
++        builder.Services.AddControllers(o => o.Filters.AddService<LifecycleFilter>()).AddApplicationPart(typeof(WebRTCController).Assembly);
++        builder.Services.AddSingleton(new HarnessState { Fresh=fresh, Started=!fresh });
++        Add<ISessionService>(builder); Add<IStreamingService>(builder); Add<IControllerService>(builder); Add<IRegisterService>(builder); Add<IRemotePlayService>(builder); Add<IDeviceSettingsService>(builder);
++        builder.Services.AddSingleton<WebRTCSignalingService>(sp => new(NullLogger<WebRTCSignalingService>.Instance, NullLoggerFactory.Instance, streamingService: sp.GetRequiredService<IStreamingService>(), serviceProvider: sp,
++            configureIce: config => { config.iceServers = new(); config.X_BindAddress = System.Net.IPAddress.Loopback; return Task.CompletedTask; }));
++        var app = builder.Build();
++        using (var scope = app.Services.CreateScope())
++        {
++            var db = scope.ServiceProvider.GetRequiredService<RPContext>();
++            var device = new RemotePlay.Models.DB.PlayStation.Device { Id="device", uuid=Guid.NewGuid(), HostId="ps5", HostName="fixture", IpAddress="127.0.0.1", HostType="PS5", IsRegistered=true };
++            db.PSDevices.Add(device);
++            foreach (var owner in new[]{"alice","bob"}) db.UserDevices.Add(new() { Id=owner, UserId=owner, DeviceId=device.Id, Device=device, IsActive=true });
++            await db.SaveChangesAsync();
++        }
++        var state=app.Services.GetRequiredService<HarnessState>(); var lifecycle=app.Services.GetRequiredService<SessionLifecycle>();
++        if (!fresh) {
++            lifecycle.Register(state.Session,"alice"); var a=lifecycle.Prepare(state.Session.Id,"alice",null); state.InitialToken=a.Token!;
++            lifecycle.SetConnected(state.Session.Id,a.Token!,true); lifecycle.Commit(state.Session.Id,"alice",a.Token!);
++        }
++        app.UseAuthentication(); app.UseAuthorization(); app.MapControllers();
++        app.MapHub<RemotePlay.Hubs.ControllerHub>("/hubs/controller");
++        app.MapHub<RemotePlay.Hubs.StreamingHub>("/hubs/streaming");
++        app.MapGet("/test/state",()=>new { remoteId=state.Session.Id, initialToken=state.InitialToken, state.Starts, state.Stops, state.MediaStops, state.Inputs, active=state.Session.IsActive, generation=lifecycle.Find(state.Session.Id)?.Generation });
++        app.MapPost("/test/sweep",async ()=> {
++            var rtc=app.Services.GetRequiredService<WebRTCSignalingService>();
++            await new LifecycleReaper(lifecycle,app.Services.GetRequiredService<ISessionService>(),app.Services.GetRequiredService<IStreamingService>(),rtc,NullLogger<LifecycleReaper>.Instance,app.Services.GetRequiredService<IServiceScopeFactory>()).SweepAsync();
++            return Results.Json(new { peers=rtc.GetAllSessions().Count(), current=lifecycle.Find(state.Session.Id)?.Current,
++                receiverAttached=typeof(RPStreamV2).GetField("_receiver",BindingFlags.NonPublic|BindingFlags.Instance)!.GetValue(state.Stream)!=null });
++        });
++        app.MapPost("/test/revoke",async (RPContext db)=> { var p=await db.UserDevices.SingleAsync(x=>x.Id=="alice");p.IsActive=false;await db.SaveChangesAsync();return Results.Ok(); });
++        app.MapPost("/test/restore",async (RPContext db)=> { var p=await db.UserDevices.SingleAsync(x=>x.Id=="alice");p.IsActive=true;await db.SaveChangesAsync();return Results.Ok(); });
++        app.MapGet("/health",()=>"loopback fake-console fixture");
++        await app.RunAsync();
++    }
++    static void Add<T>(WebApplicationBuilder b) where T:class => b.Services.AddSingleton<T>(sp=> { var p=DispatchProxy.Create<T,HarnessProxy>(); ((HarnessProxy)(object)p).State=sp.GetRequiredService<HarnessState>(); return p; });
++}
++sealed class HarnessState
++{
++    public readonly RemoteSession Session=new() { HostId="ps5", HostIp="127.0.0.1", StreamType="h264" };
++    public readonly RPStreamV2 Stream;
++    public string InitialToken="";
++    public int Starts,Stops,MediaStops,Inputs;
++    public bool Fresh, Started=true;
++    public HarnessState() { Stream=new(NullLogger<RPStreamV2>.Instance,NullLoggerFactory.Instance,Session,"127.0.0.1",9296,default); }
++}
++public class HarnessProxy : DispatchProxy
++{
++    internal HarnessState State=null!;
++    protected override object? Invoke(MethodInfo? method,object?[]? args) => method!.Name switch
++    {
++        "StartSessionAsync" => StartFake(),
++        "GetEffectiveSettingsAsync" => Task.FromResult(new DeviceStreamingSettings()),
++        "ListSessionsAsync" => Task.FromResult<IReadOnlyList<RemoteSession>>(State.Started ? new[]{State.Session} : Array.Empty<RemoteSession>()),
++        "GetSessionAsync" => Task.FromResult<RemoteSession?>((Guid)args![0]! == State.Session.Id ? State.Session : null),
++        "GetStreamAsync" or "WaitForStreamAsync" => Task.FromResult<RPStreamV2?>(State.Stream),
++        "StopSessionAsync" => Stop(),
++        "StopStreamAsync" => StopMedia(),
++        "ConnectAsync" or "StartAsync" => Task.FromResult(true),
++        "DisconnectAsync" or "StopAsync" => Task.CompletedTask,
++        "ButtonAsync" or "StickAsync" or "TriggerAsync" => Input(),
++        _ => throw new Exception("TEST SAFETY: unconfigured transport operation "+method.Name)
++    };
++    Task<RemoteSession> StartFake() {
++        if(!State.Fresh)throw new Exception("TEST SAFETY: PS5 start is forbidden outside explicit fake fresh-session mode");
++        State.Starts++;State.Started=true;return Task.FromResult(State.Session);
++    }
++    Task<bool> Stop() { State.Stops++; State.Session.StoppedAtUtc=DateTime.UtcNow; return Task.FromResult(true); }
++    Task<bool> StopMedia() { State.MediaStops++; return Task.FromResult(true); }
++    Task Input() { State.Inputs++; return Task.CompletedTask; }
++}
++sealed class FixtureAuthentication(IOptionsMonitor<AuthenticationSchemeOptions> options,ILoggerFactory logger,UrlEncoder encoder) : AuthenticationHandler<AuthenticationSchemeOptions>(options,logger,encoder)
++{
++    protected override Task<AuthenticateResult> HandleAuthenticateAsync()
++    {
++        var owner=Request.Headers.Authorization.ToString().Replace("Bearer ","");
++        if (string.IsNullOrEmpty(owner) && Request.Path.StartsWithSegments("/hubs")) owner=Request.Query["access_token"].ToString();
++        if (owner is not "alice" and not "bob") return Task.FromResult(AuthenticateResult.NoResult());
++        var identity=new ClaimsIdentity(new[]{new Claim(ClaimTypes.NameIdentifier,owner)},Scheme.Name);
++        return Task.FromResult(AuthenticateResult.Success(new AuthenticationTicket(new ClaimsPrincipal(identity),Scheme.Name)));
++    }
++}
+--- /dev/null
++++ b/RemotePlay.RegressionTests/LifecycleReaperTests.cs
+@@ -0,0 +1,91 @@
++using System.Reflection;
++using Microsoft.Extensions.DependencyInjection;
++using Microsoft.Extensions.Logging.Abstractions;
++using RemotePlay.Contracts.Services;
++using RemotePlay.Models.PlayStation;
++using RemotePlay.Services.Lifecycle;
++using RemotePlay.Services.WebRTC;
++
++static class LifecycleReaperTests
++{
++    public static async Task BusyHostDoesNotBlockSweep()
++    {
++        var clock=new ManualClock();var life=new SessionLifecycle(clock);
++        var blocked=new RemoteSession{HostId="blocked"};var other=new RemoteSession{HostId="other"};
++        life.Register(blocked,"alice");life.Register(other,"alice");clock.Advance(60);
++        var sessions=DispatchProxy.Create<ISessionService,OldSessionProxy>();((OldSessionProxy)(object)sessions).Session=other;
++        var streams=DispatchProxy.Create<IStreamingService,StopCountingProxy>();
++        using var provider=ReviewFixTests.Provider(life);
++        var rtc=new WebRTCSignalingService(NullLogger<WebRTCSignalingService>.Instance,NullLoggerFactory.Instance,serviceProvider:provider);
++        var reaper=new LifecycleReaper(life,sessions,streams,rtc,NullLogger<LifecycleReaper>.Instance,provider.GetRequiredService<IServiceScopeFactory>());
++        await life.HostGate("blocked").WaitAsync();
++        using var cancel=new CancellationTokenSource(500);
++        try { await reaper.SweepAsync(cancel.Token); }
++        catch(OperationCanceledException) { throw new Exception("busy host blocked the global sweep"); }
++        finally { life.HostGate("blocked").Release(); }
++        if(life.Find(other.Id)!=null)throw new Exception("other expired host not reaped");
++    }
++    public static async Task SlowCleanupAcrossTicks()
++    {
++        var clock=new ManualClock();var life=new SessionLifecycle(clock);
++        var slow=new RemoteSession{HostId="blocked"};life.Register(slow,"alice");clock.Advance(60);
++        var streams=DispatchProxy.Create<IStreamingService,SlowCleanupProxy>();var record=(SlowCleanupProxy)(object)streams;record.SlowId=slow.Id;
++        var sessions=DispatchProxy.Create<ISessionService,SlowCleanupProxy>();var stops=(SlowCleanupProxy)(object)sessions;
++        using var provider=ReviewFixTests.Provider(life);
++        var rtc=new WebRTCSignalingService(NullLogger<WebRTCSignalingService>.Instance,NullLoggerFactory.Instance,serviceProvider:provider);
++        var reaper=new LifecycleReaper(life,sessions,streams,rtc,NullLogger<LifecycleReaper>.Instance,provider.GetRequiredService<IServiceScopeFactory>());
++        var first=reaper.SweepAsync();
++        try
++        {
++            await record.Entered.Task.WaitAsync(TimeSpan.FromSeconds(2));
++            for(int tick=0;tick<4;tick++)
++            {
++                var other=new RemoteSession{HostId="other-"+tick};life.Register(other,"alice");clock.Advance(60);
++                await reaper.SweepAsync().WaitAsync(TimeSpan.FromSeconds(2));
++                if(life.Find(other.Id)!=null || record.Calls.GetValueOrDefault(other.Id)!=1 || stops.Calls.GetValueOrDefault(other.Id)!=1)
++                    throw new Exception("slow host blocked independent host on tick "+tick);
++                if(record.Calls.GetValueOrDefault(slow.Id)!=1 || stops.Calls.ContainsKey(slow.Id))throw new Exception("overlapping same-host cleanup on tick "+tick);
++            }
++            if(first.IsCompleted)throw new Exception("slow cleanup was not held across multiple ticks");
++        }
++        finally {record.Continue.TrySetResult();await first.WaitAsync(TimeSpan.FromSeconds(2));}
++        await reaper.SweepAsync();
++        if(record.Calls[slow.Id]!=1 || stops.Calls[slow.Id]!=1 || life.Find(slow.Id)!=null)throw new Exception("slow cleanup not completed exactly once");
++    }
++    public static async Task ExactGraceClosesBoth()
++    {
++        var clock=new ManualClock();var life=new SessionLifecycle(clock);var remote=new RemoteSession{HostId="console"};life.Register(remote,"alice");life.Prepare(remote.Id,"alice",null);
++        var sessions=DispatchProxy.Create<ISessionService,OldSessionProxy>();((OldSessionProxy)(object)sessions).Session=remote;
++        var streams=DispatchProxy.Create<IStreamingService,StopCountingProxy>();
++        using var provider=ReviewFixTests.Provider(life);
++        var rtc=new WebRTCSignalingService(NullLogger<WebRTCSignalingService>.Instance,NullLoggerFactory.Instance,serviceProvider:provider);
++        dynamic reaper=new LifecycleReaper(life,sessions,streams,rtc,NullLogger<LifecycleReaper>.Instance,provider.GetRequiredService<IServiceScopeFactory>());
++        clock.Advance(59);await reaper.SweepAsync();
++        if(!remote.IsActive||((StopCountingProxy)(object)streams).Stops!=0)throw new Exception("closed before grace");
++        clock.Advance(1);await reaper.SweepAsync();
++        if(remote.IsActive||((StopCountingProxy)(object)streams).Stops!=1||life.Find(remote.Id)!=null)throw new Exception("60s did not close console TCP and media once");
++        await reaper.SweepAsync();
++        if(((StopCountingProxy)(object)streams).Stops!=1)throw new Exception("duplicate cleanup");
++    }
++    public static async Task ConcurrentCas()
++    {
++        var life=new SessionLifecycle();var s=new RemoteSession{HostId="console"};life.Register(s,"alice");var a=life.Prepare(s.Id,"alice",null);life.SetConnected(s.Id,a.Token!,true);life.Commit(s.Id,"alice",a.Token!);
++        var results=await Task.WhenAll(Enumerable.Range(0,16).Select(_=>Task.Run(()=>life.Prepare(s.Id,"alice",a.Generation))));
++        if(results.Count(r=>r.Status==200)!=1||results.Count(r=>r.Status==409)!=15)throw new Exception("generation CAS was not atomic");
++        if(!life.IsCurrent(s.Id,"alice",a.Token!))throw new Exception("prepare interrupted original controller");
++    }
++}
++
++public class SlowCleanupProxy : DispatchProxy
++{
++    public Guid SlowId;
++    public readonly System.Collections.Concurrent.ConcurrentDictionary<Guid,int> Calls=new();
++    public readonly TaskCompletionSource Entered=new(TaskCreationOptions.RunContinuationsAsynchronously),Continue=new(TaskCreationOptions.RunContinuationsAsynchronously);
++    protected override object? Invoke(MethodInfo? method,object?[]? args)
++    {
++        if(method!.Name!="StopStreamAsync" && method.Name!="StopSessionAsync")throw new NotSupportedException(method.Name);
++        var id=(Guid)args![0]!;Calls.AddOrUpdate(id,1,(_,n)=>n+1);
++        return Stop(id);
++    }
++    async Task<bool> Stop(Guid id){if(id==SlowId){Entered.TrySetResult();await Continue.Task;}return true;}
++}
+--- /dev/null
++++ b/RemotePlay.RegressionTests/LifecycleTests.cs
+@@ -0,0 +1,44 @@
++using RemotePlay.Services.WebRTC;
++using RemotePlay.Services.Lifecycle;
++using RemotePlay.Models.PlayStation;
++
++static class LifecycleTests
++{
++    static void Check(bool v, string m) { if (!v) throw new Exception(m); }
++    public static Task Exists()
++    {
++        if (typeof(WebRTCSignalingService).Assembly.GetType("RemotePlay.Services.Lifecycle.SessionLifecycle") == null)
++            throw new Exception("Missing owner-bound lifecycle coordinator");
++        return Task.CompletedTask;
++    }
++    public static Task OwnerAndTakeover()
++    {
++        dynamic c = new SessionLifecycle();
++        var s = new RemoteSession { HostId = "ps5" };
++        c.Register(s, "alice");
++        dynamic a = c.Prepare(s.Id, "alice", (long?)null);
++        Check(a.Status == 200, "initial lease");
++        c.SetConnected(s.Id, (string)a.Token, true);
++        Check(c.Commit(s.Id, "alice", (string)a.Token), "A commit");
++        Check(c.Prepare(s.Id, "bob", (long?)1).Status == 403, "cross-owner forbidden");
++        Check(c.Prepare(s.Id, "", (long?)null).Status == 403, "anonymous forbidden");
++        dynamic conflict = c.Prepare(s.Id, "alice", (long?)null);
++        Check(conflict.Status == 409, "new page needs confirmation");
++        Check(c.IsCurrent(s.Id, "alice", (string)a.Token), "cancel does not mutate A");
++        dynamic b = c.Prepare(s.Id, "alice", (long?)conflict.Generation);
++        Check(b.Status == 200, "confirmed B prepared");
++        Check(c.IsCurrent(s.Id, "alice", (string)a.Token), "A retained until connected commit");
++        Check(!c.Commit(s.Id, "alice", (string)b.Token), "unconnected B cannot commit");
++        dynamic stale = c.Prepare(s.Id, "alice", (long?)conflict.Generation);
++        Check(stale.Status == 409, "CAS rejects stale generation");
++        dynamic latest = c.Prepare(s.Id, "alice", (long?)null);
++        dynamic third = c.Prepare(s.Id, "alice", (long?)latest.Generation);
++        c.SetConnected(s.Id, (string)b.Token, true);
++        Check(!c.Commit(s.Id, "alice", (string)b.Token), "superseded pending B cannot commit");
++        c.SetConnected(s.Id, (string)third.Token, true);
++        Check(c.Commit(s.Id, "alice", (string)third.Token), "C commits");
++        c.Release(s.Id, (string)a.Token);
++        Check(c.IsCurrent(s.Id, "alice", (string)third.Token), "late A delete cannot kill C");
++        return Task.CompletedTask;
++    }
++}
+--- /dev/null
++++ b/RemotePlay.RegressionTests/OldSessionProxy.cs
+@@ -0,0 +1,13 @@
++using System.Reflection;
++using RemotePlay.Models.PlayStation;
++public class OldSessionProxy : DispatchProxy
++{
++    public static bool LookedUp;
++    public RemoteSession Session = null!;
++    protected override object? Invoke(MethodInfo? method, object?[]? args)
++    {
++        if (method!.Name == "GetSessionAsync") { LookedUp=true; return Task.FromResult<RemoteSession?>(Session); }
++        if (method.Name == "StopSessionAsync") { Session.StoppedAtUtc=DateTime.UtcNow; return Task.FromResult(true); }
++        throw new NotSupportedException(method.Name);
++    }
++}
+--- a/RemotePlay.RegressionTests/Program.cs
++++ b/RemotePlay.RegressionTests/Program.cs
+@@ -8,6 +8,8 @@
+ using RemotePlay.Services.WebRTC;
+ using SIPSorcery.Net;
+ 
++if (args.Contains("--lifecycle-fresh-http-server")) { await LifecycleHttpHarness.Run(fresh:true); return 0; }
++if (args.Contains("--lifecycle-http-server")) { await LifecycleHttpHarness.Run(); return 0; }
+ var tests = new List<(string, Func<Task>)> { ("non_OK_answer_is_failure", AnswerFailure), ("video_waits_for_negotiation_and_connection", VideoGate), ("early_ICE_candidates_reach_session", EarlyIce), ("answer_summary_is_allowlisted", SummaryPrivacy), ("answer_rejection_HTTP_400", ControllerFailure), ("video_gate_state_matrix", VideoMatrix), ("unready_video_no_keyframe_storm", NoKeyframeStorm), ("OK_answer_logs_summary", AnswerSuccess), ("session_creation_keeps_early_candidates", SessionIce), ("safari_42e01f_accepts_H26496", SafariH264Profile) };
+ tests.Add(("stream_wait_timeout", StreamReadinessTests.WaitTimeout));
+ tests.Add(("stream_caller_cancellation", StreamReadinessTests.CallerCancellation));
+@@ -22,6 +24,24 @@
+ tests.Add(("network_dns_ttl", NetworkTests.Ttl));
+ tests.Add(("network_dns_timeout", NetworkTests.Timeout));
+ if (Environment.GetEnvironmentVariable("PSRP_RUN_STUN_INTEGRATION") == "1") tests.Add(("network_real_application_ICE", NetworkTests.RealIce));
++tests.Add(("lifecycle_coordinator", LifecycleTests.Exists));
++tests.Add(("lifecycle_owner_takeover", LifecycleTests.OwnerAndTakeover));
++tests.Add(("browser_delete_keeps_console", BrowserLifetimeTests.RemovalKeepsConsole));
++tests.Add(("lifecycle_auth_boundaries", LifecycleBoundaryTests.AuthBoundaries));
++tests.Add(("lifecycle_clock_boundaries", LifecycleBoundaryTests.ClockBoundaries));
++tests.Add(("stream_reuse_never_restarts", StreamLifecycleTests.ReuseNeverRestarts));
++tests.Add(("stream_old_callback_pending", StreamLifecycleTests.OldCallbackCannotStopPending));
++tests.Add(("lifecycle_reaper_exact_grace", LifecycleReaperTests.ExactGraceClosesBoth));
++tests.Add(("lifecycle_concurrent_CAS", LifecycleReaperTests.ConcurrentCas));
++tests.Add(("review_tap_range", ReviewFixTests.TapRange));
++tests.Add(("review_tap_gate", ReviewFixTests.TapGate));
++tests.Add(("review_reaper_busy_host", LifecycleReaperTests.BusyHostDoesNotBlockSweep));
++tests.Add(("review_revocation_media", ReviewFixTests.RevocationDetachesMedia));
++tests.Add(("review_wake_permission", ReviewFixTests.WakeRequiresDevice));
++tests.Add(("review_tap_cancel_replacement", ReviewFixTests.TapCancellationAndReplacement));
++tests.Add(("review_reaper_slow_multitick", LifecycleReaperTests.SlowCleanupAcrossTicks));
++tests.Add(("review_receiver_atomic_pipeline", ReceiverAtomicityTests.Pipeline));
++tests.Add(("review_receiver_atomic_legacy", ReceiverAtomicityTests.Legacy));
+ var selected = tests.Where(t => args.Length == 0 || args.Contains(t.Item1)).ToArray();
+ Check(selected.Length > 0, "no matching regression tests selected");
+ int failures = 0;
+--- /dev/null
++++ b/RemotePlay.RegressionTests/ReceiverAtomicityTests.cs
+@@ -0,0 +1,100 @@
++using System.Reflection;
++using Microsoft.Extensions.Logging;
++using Microsoft.Extensions.Logging.Abstractions;
++using RemotePlay.Models.PlayStation;
++using RemotePlay.Services.Streaming.AV;
++using RemotePlay.Services.Streaming.Core;
++using RemotePlay.Services.Streaming.Pipeline;
++using RemotePlay.Services.Streaming.Receiver;
++
++static class ReceiverAtomicityTests
++{
++    static object? Get(object target,string name) => target.GetType().GetField(name,BindingFlags.Instance|BindingFlags.NonPublic)!.GetValue(target);
++    static void Set(object target,string name,object value) => target.GetType().GetField(name,BindingFlags.Instance|BindingFlags.NonPublic)!.SetValue(target,value);
++    public static Task Pipeline() => Exercise(true);
++    public static Task Legacy() => Exercise(false);
++    static async Task Exercise(bool pipelineMode)
++    {
++        using var pause=new ReceiverRoutePause();
++        using var stream=new RPStreamV2(NullLogger<RPStreamV2>.Instance,NullLoggerFactory.Instance,new RemoteSession{HostId="fixture"},"127.0.0.1",9296,default);
++        var a=new RecordingReceiver();var b=new RecordingReceiver();
++        Set(stream,"_usePipeline",pipelineMode);
++        // Real routing objects, no console transport or test hooks in production code.
++        using var pipeline=new AVPipelineCoordinator(NullLogger<AVPipelineCoordinator>.Instance,NullLoggerFactory.Instance,"PS5",a,default);
++        var output=(OutputPipeline)Get(pipeline,"_outputPipeline")!;
++        var handler=new AVHandler(NullLogger<AVHandler>.Instance,"PS5",null,a,default);
++        if(pipelineMode) { Set(stream,"_avPipeline",pipeline);Set(output,"_logger",pause); }
++        else { Set(stream,"_avHandler",handler);Set(handler,"_logger",pause); }
++        Set(stream,"_receiver",a);
++        Exception? removeError=null,addError=null;
++        using var addStarted=new ManualResetEventSlim();using var addFinished=new ManualResetEventSlim();
++        var remove=new Thread(()=>{try {stream.RemoveReceiver(a);}catch(Exception ex){removeError=ex;}}){IsBackground=true};
++        var add=new Thread(()=>{addStarted.Set();try {stream.AddReceiver(b);}catch(Exception ex){addError=ex;}finally {addFinished.Set();}}){IsBackground=true};
++        bool overlapped=false;
++        try
++        {
++            remove.Start();
++            if(!pause.Entered.Wait(3000))throw new Exception("remove did not enter real receiver routing update");
++            add.Start();if(!addStarted.Wait(3000))throw new Exception("add worker did not start");
++            // The dedicated worker either completes (old bug) or blocks on the shared monitor.
++            // No sleep-based scheduling or probabilistic stress is needed.
++            if(!SpinWait.SpinUntil(()=>addFinished.IsSet || (add.ThreadState & ThreadState.WaitSleepJoin)!=0,3000))throw new Exception("add worker neither completed nor blocked");
++            overlapped=addFinished.IsSet;
++        }
++        finally {pause.Continue.Set();remove.Join(3000);if(add.ThreadState!=ThreadState.Unstarted)add.Join(3000);}
++        if(removeError!=null || addError!=null)throw new Exception("receiver worker failed",removeError??addError);
++        if(!ReferenceEquals(Get(stream,"_receiver"),b))throw new Exception("receiver reference is not B");
++        if(pipelineMode)
++        {
++            if(!ReferenceEquals(Get(pipeline,"_receiver"),b) || !ReferenceEquals(Get(output,"_receiver"),b))throw new Exception("real pipeline route is not B");
++            output.TryPushAudioFrame(new ProcessedFrame{Data=new byte[]{1,2,3}});
++            await b.Audio.Task.WaitAsync(TimeSpan.FromSeconds(3));
++            if(a.Packets!=0 || b.Packets!=1)throw new Exception("actual output media was not delivered exclusively to B");
++        }
++        else
++        {
++            if(!ReferenceEquals(Get(handler,"_receiver"),b))throw new Exception("real AVHandler media route is not B");
++            Set(handler,"_audioReceiver",new AudioReceiver());
++            // Six real parsed audio packets fill the legacy jitter buffer and exercise
++            // AVHandler.ProcessSinglePacket -> AudioReceiver -> current receiver callback.
++            for(ushort i=0;i<6;i++)
++            {
++                var raw=new byte[23];raw[0]=(byte)RemotePlay.Services.Streaming.Protocol.HeaderType.AUDIO;
++                System.Buffers.Binary.BinaryPrimitives.WriteUInt16BigEndian(raw.AsSpan(3,2),i);
++                System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(raw.AsSpan(5,4),0x0301);
++                raw[20]=1;raw[21]=2;raw[22]=3;
++                if(!AVPacket.TryParse(raw,"PS5",out var packet))throw new Exception("audio fixture parse failed");
++                typeof(AVHandler).GetMethod("ProcessSinglePacket",BindingFlags.NonPublic|BindingFlags.Instance)!.Invoke(handler,new object[]{packet});
++            }
++            if(a.Packets!=0 || b.Packets!=6)throw new Exception("actual legacy audio was not delivered exclusively to B");
++        }
++        stream.RemoveReceiver(a); // A's later disconnect must remain harmless.
++        if(!ReferenceEquals(Get(stream,"_receiver"),b))throw new Exception("stale A removed installed B");
++        Console.WriteLine($"receiver mode={(pipelineMode?"pipeline":"legacy")} addOverlappedRemoval={overlapped} reference=B realRoute=B A.audio={a.Packets} B.audio={b.Packets}");
++        if(overlapped)throw new Exception("B installed while A was still inside receiver routing update: check/reference/route are not atomic");
++    }
++    sealed class RecordingReceiver : IAVReceiver
++    {
++        public int Packets;public TaskCompletionSource Audio=new(TaskCreationOptions.RunContinuationsAsynchronously);
++        public void OnAudioPacket(byte[] packet){Interlocked.Increment(ref Packets);Audio.TrySetResult();}
++        public void OnVideoPacket(byte[] packet) { }
++        public void OnStreamInfo(byte[] videoHeader,byte[] audioHeader) { }
++        public void SetVideoCodec(string codec) { }
++        public void SetAudioCodec(string codec) { }
++        public void EnterWaitForIdr() { }
++    }
++    // Pause an existing logger call INSIDE the real SetReceiver, only when installing the sink.
++    // This proves the boundary covers routing, rather than just a CAS on _receiver.
++    sealed class ReceiverRoutePause : ILogger<OutputPipeline>,ILogger<AVHandler>,IDisposable
++    {
++        public readonly ManualResetEventSlim Entered=new(),Continue=new();
++        public IDisposable? BeginScope<TState>(TState state) where TState:notnull => null;
++        public bool IsEnabled(LogLevel level)=>true;
++        public void Log<TState>(LogLevel level,EventId id,TState state,Exception? exception,Func<TState,Exception?,string> formatter)
++        {
++            if(formatter(state,exception).Contains("-> DefaultReceiver") || formatter(state,exception).Contains("to DefaultReceiver"))
++            {Entered.Set();if(!Continue.Wait(5000))throw new Exception("routing pause timed out");}
++        }
++        public void Dispose(){Entered.Dispose();Continue.Dispose();}
++    }
++}
+--- a/RemotePlay.RegressionTests/RemotePlay.RegressionTests.csproj
++++ b/RemotePlay.RegressionTests/RemotePlay.RegressionTests.csproj
+@@ -1,5 +1,6 @@
+ <Project Sdk="Microsoft.NET.Sdk">
+   <PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net10.0</TargetFramework><ImplicitUsings>enable</ImplicitUsings><Nullable>enable</Nullable></PropertyGroup>
++  <ItemGroup><PackageReference Include="Microsoft.EntityFrameworkCore.InMemory" Version="10.0.14" /></ItemGroup>
+   <ItemGroup><PackageReference Include="Microsoft.EntityFrameworkCore.Relational" Version="10.0.14" /></ItemGroup>
+   <ItemGroup><ProjectReference Include="../RemotePlay/RemotePlay.csproj" /></ItemGroup>
+   <ItemGroup><None Update="safari_h264_profile.py;safari_h264_match.cjs" CopyToOutputDirectory="PreserveNewest" /></ItemGroup>
+--- /dev/null
++++ b/RemotePlay.RegressionTests/ReviewFixTests.cs
+@@ -0,0 +1,147 @@
++using System.Reflection;
++using System.Security.Claims;
++using Microsoft.AspNetCore.Http;
++using Microsoft.AspNetCore.Mvc;
++using Microsoft.AspNetCore.Mvc.Abstractions;
++using Microsoft.AspNetCore.Mvc.Filters;
++using Microsoft.AspNetCore.Routing;
++using Microsoft.EntityFrameworkCore;
++using Microsoft.Extensions.DependencyInjection;
++using Microsoft.Extensions.Logging.Abstractions;
++using RemotePlay.Contracts.Services;
++using RemotePlay.Controllers;
++using RemotePlay.Models.Context;
++using RemotePlay.Models.PlayStation;
++using RemotePlay.Services.Controller;
++using RemotePlay.Services.Lifecycle;
++using RemotePlay.Services.Streaming;
++using RemotePlay.Services.Streaming.Controller;
++using RemotePlay.Services.WebRTC;
++
++static class ReviewFixTests
++{
++    public static ServiceProvider Provider(SessionLifecycle life, IControllerService? controller=null)
++    {
++        var options=new DbContextOptionsBuilder<RPContext>().UseInMemoryDatabase(Guid.NewGuid().ToString()).Options;
++        var collection=new ServiceCollection().AddSingleton(life).AddScoped<RPContext>(_=>new HarnessDb(options)).AddScoped<LifecycleAccess>();
++        if(controller!=null)collection.AddSingleton(controller);
++        var provider=collection.BuildServiceProvider();
++        using var scope=provider.CreateScope();var db=scope.ServiceProvider.GetRequiredService<RPContext>();
++        foreach(var host in new[]{"console","blocked","other"})
++        {
++            var d=new RemotePlay.Models.DB.PlayStation.Device{Id=host,uuid=Guid.NewGuid(),HostName="fixture",HostId=host};
++            db.PSDevices.Add(d);db.UserDevices.Add(new(){Id=host,UserId="alice",DeviceId=host,Device=d,IsActive=true});
++        }
++        db.SaveChanges();return provider;
++    }
++    public static async Task RevocationDetachesMedia()
++    {
++        var clock=new ManualClock();var life=new SessionLifecycle(clock);var state=new HarnessState();
++        life.Register(state.Session,"alice");var a=life.Prepare(state.Session.Id,"alice",null);
++        life.Bind(state.Session.Id,"alice",a.Token!,"browser");life.SetConnected(state.Session.Id,a.Token!,true);life.Commit(state.Session.Id,"alice",a.Token!);
++        var dbOptions=new DbContextOptionsBuilder<RPContext>().UseInMemoryDatabase(Guid.NewGuid().ToString()).Options;
++        using var provider=new ServiceCollection().AddSingleton(life).AddScoped<RPContext>(_=>new HarnessDb(dbOptions)).AddScoped<LifecycleAccess>().BuildServiceProvider();
++        var streams=DispatchProxy.Create<IStreamingService,HarnessProxy>();((HarnessProxy)(object)streams).State=state;
++        var sessions=DispatchProxy.Create<ISessionService,HarnessProxy>();((HarnessProxy)(object)sessions).State=state;
++        var rtc=new WebRTCSignalingService(NullLogger<WebRTCSignalingService>.Instance,NullLoggerFactory.Instance,streamingService:streams,serviceProvider:provider);
++        using var peer=new SIPSorcery.Net.RTCPeerConnection(new SIPSorcery.Net.RTCConfiguration{iceServers=new()});
++        using var receiver=new RemotePlay.Services.Streaming.Receiver.WebRTCReceiver("browser",peer,NullLogger<RemotePlay.Services.Streaming.Receiver.WebRTCReceiver>.Instance);
++        state.Stream.AddReceiver(receiver);
++        var browser=new WebRTCSession{SessionId="browser",OwnerId="alice",LifecycleToken=a.Token!,PeerConnection=peer,Receiver=receiver,StreamingSessionId=state.Session.Id};
++        ((System.Collections.Concurrent.ConcurrentDictionary<string,WebRTCSession>)typeof(WebRTCSignalingService).GetField("_sessions",BindingFlags.NonPublic|BindingFlags.Instance)!.GetValue(rtc)!)["browser"]=browser;
++        var ctor=typeof(LifecycleReaper).GetConstructors().Single();
++        object[] args={life,sessions,streams,rtc,NullLogger<LifecycleReaper>.Instance,provider.GetRequiredService<IServiceScopeFactory>()};
++        var reaper=(LifecycleReaper)ctor.Invoke(args.Take(ctor.GetParameters().Length).ToArray());
++        await reaper.SweepAsync();
++        if(rtc.GetSession("browser")!=null || life.Allows(state.Session.Id,"alice",a.Token!))throw new Exception("revoked connected media and lease survive cleanup");
++        if(ReferenceEquals(typeof(RemotePlay.Services.Streaming.Core.RPStreamV2).GetField("_receiver",BindingFlags.NonPublic|BindingFlags.Instance)!.GetValue(state.Stream),receiver))throw new Exception("revoked receiver still attached to media stream");
++        if(!state.Session.IsActive || state.Stops!=0)throw new Exception("revocation skipped grace policy");
++        clock.Advance(60);await reaper.SweepAsync();
++        if(state.Stops!=1 || state.MediaStops!=1)throw new Exception("revoked lease did not expire at grace");
++    }
++    public static async Task TapCancellationAndReplacement()
++    {
++        var life=new SessionLifecycle();var session=new RemoteSession{HostId="console"};life.Register(session,"alice");
++        var lease=life.Prepare(session.Id,"alice",null);life.SetConnected(session.Id,lease.Token!,true);life.Commit(session.Id,"alice",lease.Token!);
++        var controller=DispatchProxy.Create<IControllerService,TapRecordingProxy>();var recording=(TapRecordingProxy)(object)controller;
++        using var provider=Provider(life,controller);
++        var user=new ClaimsPrincipal(new ClaimsIdentity(new[]{new Claim(ClaimTypes.NameIdentifier,"alice")},"test"));
++        using var cancel=new CancellationTokenSource();
++        var tap=LifecycleButton.SendAsync(provider,user,lease.Token!,session.Id,FeedbackEvent.ButtonType.CROSS,IControllerService.ButtonAction.TAP,1000,cancel.Token);
++        await recording.Pressed.Task.WaitAsync(TimeSpan.FromSeconds(1));
++        if(!await life.HostGate("console").WaitAsync(0))throw new Exception("tap holds gate during delay");life.HostGate("console").Release();
++        cancel.Cancel();
++        try { await tap.WaitAsync(TimeSpan.FromMilliseconds(500));throw new Exception("tap ignored cancellation"); }
++        catch(OperationCanceledException) { }
++        if(!recording.Actions.SequenceEqual(new[]{IControllerService.ButtonAction.PRESS,IControllerService.ButtonAction.RELEASE}))throw new Exception("cancel left button pressed");
++        using var secondCancel=new CancellationTokenSource();
++        tap=LifecycleButton.SendAsync(provider,user,lease.Token!,session.Id,FeedbackEvent.ButtonType.CROSS,IControllerService.ButtonAction.TAP,1000,secondCancel.Token);
++        var replacement=life.Prepare(session.Id,"alice",lease.Generation);life.SetConnected(session.Id,replacement.Token!,true);life.Commit(session.Id,"alice",replacement.Token!);
++        secondCancel.Cancel();try {await tap;}catch(OperationCanceledException) { }
++        if(recording.Actions.Count!=3)throw new Exception("old tap released replacement controller's button");
++    }
++    public static async Task WakeRequiresDevice()
++    {
++        var life=new SessionLifecycle();using var provider=Provider(life);
++        using var scope=provider.CreateScope();var access=scope.ServiceProvider.GetRequiredService<LifecycleAccess>();
++        var http=new DefaultHttpContext();http.User=new ClaimsPrincipal(new ClaimsIdentity(new[]{new Claim(ClaimTypes.NameIdentifier,"bob")},"test"));
++        var descriptor=new ActionDescriptor();descriptor.RouteValues["action"]="WakeUpConsole";
++        var context=new ActionContext(http,new RouteData(),descriptor);
++        var controller=System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(PlayStationController));
++        var executing=new ActionExecutingContext(context,new List<IFilterMetadata>(),new Dictionary<string,object?>{{"hostId","console"}},controller);
++        var rtc=new WebRTCSignalingService(NullLogger<WebRTCSignalingService>.Instance,NullLoggerFactory.Instance,serviceProvider:provider);
++        bool invoked=false;
++        await new LifecycleFilter(life,access,rtc).OnActionExecutionAsync(executing,()=>{invoked=true;return Task.FromResult(new ActionExecutedContext(context,new List<IFilterMetadata>(),controller));});
++        if(invoked || executing.Result is not ObjectResult {StatusCode:403})throw new Exception("wake without UserDevice permission reached console action instead of 403");
++    }
++    public static async Task TapGate()
++    {
++        var life=new SessionLifecycle();var session=new RemoteSession{HostId="console"};life.Register(session,"alice");
++        var a=life.Prepare(session.Id,"alice",null);life.SetConnected(session.Id,a.Token!,true);life.Commit(session.Id,"alice",a.Token!);
++        using var db=new HarnessDb(new DbContextOptionsBuilder<RPContext>().UseInMemoryDatabase(Guid.NewGuid().ToString()).Options);
++        var device=new RemotePlay.Models.DB.PlayStation.Device{Id="device",uuid=Guid.NewGuid(),HostName="fixture",HostId="console"};
++        db.PSDevices.Add(device);db.UserDevices.Add(new(){Id="alice",UserId="alice",DeviceId="device",Device=device,IsActive=true});await db.SaveChangesAsync();
++        var http=new DefaultHttpContext();http.User=new ClaimsPrincipal(new ClaimsIdentity(new[]{new Claim(ClaimTypes.NameIdentifier,"alice")},"test"));http.Request.Headers["X-PSRP-Lease"]=a.Token;
++        var descriptor=new ActionDescriptor();descriptor.RouteValues["action"]="ControllerButton";
++        var context=new ActionContext(http,new RouteData(),descriptor);
++        var controller=System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(PlayStationController));
++        var executing=new ActionExecutingContext(context,new List<IFilterMetadata>(),new Dictionary<string,object?>{{"sessionId",session.Id}},controller);
++        using var provider=new ServiceCollection().BuildServiceProvider();
++        var rtc=new WebRTCSignalingService(NullLogger<WebRTCSignalingService>.Instance,NullLoggerFactory.Instance,serviceProvider:provider);
++        var filter=new LifecycleFilter(life,new LifecycleAccess(db,life),rtc);
++        await filter.OnActionExecutionAsync(executing,async()=>{
++            var acquired=await life.HostGate("console").WaitAsync(0);
++            if(!acquired)throw new Exception("HTTP tap holds host gate across action/user delay");
++            life.HostGate("console").Release();await Task.Yield();return new ActionExecutedContext(context,new List<IFilterMetadata>(),controller);
++        });
++    }
++    public static async Task TapRange()
++    {
++        var service=new ControllerService(NullLogger<ControllerService>.Instance,DispatchProxy.Create<IStreamingService,StopCountingProxy>(),new NullControllerHub());
++        foreach(var delay in new[]{-1,1001,int.MaxValue})
++        {
++            bool rejected=false;
++            try { await service.ButtonAsync(Guid.NewGuid(),FeedbackEvent.ButtonType.CROSS,IControllerService.ButtonAction.TAP,delay); }
++            catch(ArgumentOutOfRangeException) { rejected=true; }
++            if(!rejected)throw new Exception("invalid tap duration accepted: "+delay);
++        }
++    }
++}
++sealed class NullControllerHub : Microsoft.AspNetCore.SignalR.IHubContext<RemotePlay.Hubs.ControllerHub>
++{
++    public Microsoft.AspNetCore.SignalR.IHubClients Clients => null!;
++    public Microsoft.AspNetCore.SignalR.IGroupManager Groups => null!;
++}
++
++public class TapRecordingProxy : DispatchProxy
++{
++    public readonly TaskCompletionSource Pressed=new(TaskCreationOptions.RunContinuationsAsynchronously);
++    public readonly List<IControllerService.ButtonAction> Actions=new();
++    protected override object? Invoke(MethodInfo? method,object?[]? args)
++    {
++        if(method!.Name!="ButtonAsync")throw new NotSupportedException(method.Name);
++        var action=(IControllerService.ButtonAction)args![2]!;Actions.Add(action);
++        if(action==IControllerService.ButtonAction.PRESS)Pressed.TrySetResult();
++        return Task.CompletedTask;
++    }
++}
+--- /dev/null
++++ b/RemotePlay.RegressionTests/StreamLifecycleTests.cs
+@@ -0,0 +1,41 @@
++using System.Reflection;
++using System.Collections.Concurrent;
++using Microsoft.Extensions.DependencyInjection;
++using Microsoft.Extensions.Logging.Abstractions;
++using RemotePlay.Contracts.Services;
++using RemotePlay.Models.PlayStation;
++using RemotePlay.Services.Streaming;
++using RemotePlay.Services.Streaming.Core;
++
++static class StreamLifecycleTests
++{
++    static void Check(bool v,string m) { if(!v) throw new Exception(m); }
++    static (RemoteSession s, StreamingService service, RPStreamV2 rp) Fixture()
++    {
++        var s=new RemoteSession { HostIp="not-an-IP" };
++        var proxy=DispatchProxy.Create<ISessionService,OldSessionProxy>(); OldSessionProxy.LookedUp=false; ((OldSessionProxy)(object)proxy).Session=s;
++        var service=new StreamingService(NullLogger<StreamingService>.Instance,proxy,NullLoggerFactory.Instance,new ServiceCollection().BuildServiceProvider());
++        var rp=new RPStreamV2(NullLogger<RPStreamV2>.Instance,NullLoggerFactory.Instance,s,"127.0.0.1",9296,default);
++        return (s,service,rp);
++    }
++    static ConcurrentDictionary<Guid,RPStreamV2> Streams(StreamingService service,string name) => (ConcurrentDictionary<Guid,RPStreamV2>)typeof(StreamingService).GetField(name,BindingFlags.Instance|BindingFlags.NonPublic)!.GetValue(service)!;
++    public static async Task ReuseNeverRestarts()
++    {
++        var(s,service,rp)=Fixture(); Streams(service,"_streams")[s.Id]=rp;
++        Check(await service.StartStreamAsync(s.Id,false),"already running stream should be reused");
++        Check(ReferenceEquals(await service.GetStreamAsync(s.Id),rp),"existing stream replaced");
++        await rp.StopAsync();
++    }
++    public static async Task OldCallbackCannotStopPending()
++    {
++        var(s,service,old)=Fixture();
++        var newer=new RPStreamV2(NullLogger<RPStreamV2>.Instance,NullLoggerFactory.Instance,s,"127.0.0.1",9296,default);
++        Streams(service,"_startingStreams")[s.Id]=newer;
++        await (Task)typeof(StreamingService).GetMethod("HandleStreamDisconnectAsync",BindingFlags.Instance|BindingFlags.NonPublic)!.Invoke(service,new object[]{s.Id,old})!;
++        Check(Streams(service,"_startingStreams").TryGetValue(s.Id,out var current)&&ReferenceEquals(current,newer),"old callback removed pending new stream");
++        Check(s.IsActive,"old callback stopped new session");
++        // An obsolete callback must return before even looking up the current session.
++        Check(!OldSessionProxy.LookedUp,"old callback reached shared session while a replacement was pending");
++        await old.StopAsync(); await newer.StopAsync();
++    }
++}
+--- a/RemotePlay.Web/src/hooks/use-streaming-connection.ts
++++ b/RemotePlay.Web/src/hooks/use-streaming-connection.ts
+@@ -20,6 +20,7 @@
+   resetDualSenseEffects,
+   resetDualSenseMotion,
+ } from '@/service/dualsense-hid.service'
++import { currentLease, rememberLease } from '@/service/lifecycle-lease'
+ import { apiRequest } from '@/service/api-client'
+ import { optimizeSdpForLowLatency, optimizeVideoForLowLatency } from '@/utils/webrtc-optimization'
+ import { createKeyboardHandler } from '@/utils/keyboard-mapping'
+@@ -180,6 +181,7 @@
+   const lastDecodedFrameCountRef = useRef<number | null>(null)
+   // 解码器卡死检测：解码帧数最后一次增长的时间，以及当时已收到的帧数
+   const decoderWatchRef = useRef<{ decoded: number; received: number; decodedAt: number } | null>(null)
++  const attemptRef = useRef<object>({})
+   const rebuildInFlightRef = useRef(false)
+   const lastRebuildAtRef = useRef(0)
+   const rebuildWebRtcRef = useRef<((reason: string) => void) | null>(null)
+@@ -1128,6 +1130,7 @@
+   )
+ 
+   const disconnect = useCallback(() => {
++    attemptRef.current = {}
+     stopStickProcessing()
+     gamepadEnabledRef.current = false
+     tearDownMouseRightStick()
+@@ -1188,7 +1191,7 @@
+       videoRef.current.srcObject = null
+     }
+ 
+-    const currentWebrtcSessionId = webrtcSessionId
++    const currentWebrtcSessionId = webrtcSessionIdRef.current
+     if (currentWebrtcSessionId) {
+       setWebrtcSessionId(null)
+       webrtcSessionIdRef.current = null
+@@ -1202,19 +1205,9 @@
+         })
+     }
+ 
+-    const currentRemotePlaySessionId = remotePlaySessionId
+-    if (currentRemotePlaySessionId) {
+-      setRemotePlaySessionId(null)
+-      apiRequest(`/playstation/stop-session?sessionId=${encodeURIComponent(currentRemotePlaySessionId)}`, {
+-        method: 'POST',
+-      })
+-        .then(() => {
+-          console.log('✅ Remote Play Session 已关闭')
+-        })
+-        .catch((error) => {
+-          console.error('❌ 关闭 Remote Play Session 失败:', error)
+-        })
+-    }
++    // Browser exit releases only its peer. The NAS-console lease has its own grace timer.
++    setRemotePlaySessionId(null)
++    remotePlaySessionIdRef.current = null
+ 
+     setIsConnected(false)
+     isConnectedRef.current = false
+@@ -1225,6 +1218,13 @@
+     setIsStalling(false)
+   }, [remotePlaySessionId, stopStickProcessing, t, videoRef, webrtcSessionId])
+ 
++  const endRemoteSession = useCallback(async () => {
++    const id = remotePlaySessionIdRef.current
++    if (!id || !window.confirm('明确结束 PS5 远程会话？这会关闭 NAS 与 PS5 的连接。')) return
++    await apiRequest(`/playstation/stop-session?sessionId=${encodeURIComponent(id)}`, { method: 'POST' })
++    disconnect()
++  }, [disconnect])
++
+   const connect = useCallback(async (options?: ConnectOptions) => {
+     // onClick 等处直接把 connect 当回调时，参数是事件对象，这里只认字符串
+     const reuseRemotePlaySessionId =
+@@ -1253,6 +1253,22 @@
+       setConnectionState(t('streaming.connection.state.connecting'))
+     }
+ 
++    const previousAttempt = attemptRef.current
++    const attempt = {}
++    attemptRef.current = attempt
++    const isCurrent = () => attemptRef.current === attempt
++    const assertCurrent = () => { if (!isCurrent()) throw new DOMException('连接操作已过期', 'AbortError') }
++    // Timers from this attempt never act on refs belonging to a replacement peer.
++    const setTimeout = (callback: () => void, ms?: number) => window.setTimeout(() => { if (isCurrent()) callback() }, ms)
++    const setInterval = (callback: () => void, ms?: number) => window.setInterval(() => { if (isCurrent()) callback() }, ms)
++    let switchCommitted = false
++    const previousMedia = videoRef.current?.srcObject
++    const previousLease = currentLease()
++    const previousFlags = {
++      streamBound: isStreamBoundRef.current,
++      videoTrack: hasVideoTrackRef.current,
++      initialKeyframe: initialKeyframeRequestedRef.current,
++    }
+     // 重建模式：保留 PS5 会话和旧连接，新连接绑定到串流后再关闭旧连接
+     const previousPeerConnection = isRebuild ? peerConnectionRef.current : null
+     const previousWebrtcSessionId = isRebuild ? webrtcSessionIdRef.current : null
+@@ -1265,20 +1281,20 @@
+     try {
+       let sessionId: string
+       if (reuseRemotePlaySessionId) {
+-        sessionId = reuseRemotePlaySessionId
++        if (!hostId) throw new Error('设备信息缺失')
++        const prepared = await streamingService.startSession(hostId, undefined, isCurrent)
++        assertCurrent()
++        sessionId = prepared.data!.id
++        if (sessionId !== reuseRemotePlaySessionId) throw new Error('原 PS5 会话已失效，请重新连接')
+         remotePlaySessionIdRef.current = sessionId
+       } else {
+-      const deviceReady = await prepareDevice()
+-      if (!deviceReady) {
+-        throw new Error(t('streaming.connection.errors.deviceNotReady'))
+-      }
+-
+       setConnectionState(t('streaming.connection.state.creatingSession'))
+ 
+       if (!hostId) {
+         throw new Error(t('streaming.connection.errors.missingDeviceInfo'))
+       }
+-      const sessionResponse = await streamingService.startSession(hostId)
++      const sessionResponse = await streamingService.startSession(hostId, prepareDevice, isCurrent)
++      assertCurrent()
+       console.log('会话创建响应:', sessionResponse)
+       console.log('响应数据字段:', {
+         success: sessionResponse.success,
+@@ -1324,6 +1340,7 @@
+         remotePlaySessionId: sessionId,
+         preferLanCandidates: isLikelyLan,
+       })
++      assertCurrent()
+       console.log('Offer 响应:', offerResponse)
+ 
+       if (!offerResponse.success) {
+@@ -1509,6 +1526,7 @@
+       let mediaStream: MediaStream | null = null
+ 
+       peerConnection.ontrack = (event) => {
++        if (!isCurrent()) return
+         console.log('📺 收到媒体轨道:', event.track.kind, event.streams)
+         console.log('📺 轨道详情:', {
+           kind: event.track.kind,
+@@ -1876,6 +1894,7 @@
+       let hasHostCandidate = false
+       
+       peerConnection.onicecandidate = async (event) => {
++        if (!isCurrent()) return
+         if (event.candidate && webrtcSessionIdValue) {
+           const candidateType = event.candidate.type || 'unknown'
+           const candidateStr = event.candidate.candidate || ''
+@@ -1946,6 +1965,7 @@
+       }
+ 
+       peerConnection.onconnectionstatechange = () => {
++        if (!isCurrent()) return
+         const state = peerConnection.connectionState
+         const iceState = peerConnection.iceConnectionState
+         const signalingState = peerConnection.signalingState
+@@ -2089,6 +2109,7 @@
+ 
+       // ✅ ICE Restart 处理函数（使用 ref 存储状态，避免闭包问题）
+       const handleIceRestart = async () => {
++        if (!isCurrent()) return
+         if (!webrtcSessionIdRef.current) {
+           console.warn('⚠️ 无法执行 ICE Restart：SessionId 为空')
+           return
+@@ -2098,7 +2119,7 @@
+           console.log('🔄 开始处理 ICE Restart...')
+           
+           // ✅ 方法1：尝试从后端获取待处理的 Offer
+-          const offer = await streamingHubService.getIceRestartOffer(webrtcSessionIdRef.current)
++          const offer = await streamingHubService.getIceRestartOffer(webrtcSessionIdValue)
+           
+           if (offer) {
+             console.log('✅ 收到 ICE Restart Offer，重新协商...')
+@@ -2107,11 +2128,11 @@
+           }
+           
+           // ✅ 方法2：如果后端没有待处理的 Offer，主动触发 ICE Restart
+-          const success = await streamingHubService.handleIceRestart(webrtcSessionIdRef.current)
++          const success = await streamingHubService.handleIceRestart(webrtcSessionIdValue)
+           if (success) {
+             // 等待后端创建新的 Offer
+             setTimeout(async () => {
+-              const newOffer = await streamingHubService.getIceRestartOffer(webrtcSessionIdRef.current!)
++              const newOffer = await streamingHubService.getIceRestartOffer(webrtcSessionIdValue)
+               if (newOffer) {
+                 await handleIceRestartOffer(newOffer)
+               }
+@@ -2124,7 +2145,8 @@
+       
+       // ✅ 处理 ICE Restart Offer（在 PeerConnection 创建后定义，以便访问）
+       const handleIceRestartOffer = async (offerSdp: string) => {
+-        const currentPeerConnection = peerConnectionRef.current
++        if (!isCurrent()) return
++        const currentPeerConnection = peerConnection
+         if (!currentPeerConnection || !webrtcSessionIdRef.current) {
+           console.warn('⚠️ 无法处理 ICE Restart Offer：PeerConnection 或 SessionId 为空')
+           return
+@@ -2159,11 +2181,12 @@
+           }
+           
+           await currentPeerConnection.setLocalDescription(answer)
++          assertCurrent()
+           reinforceLatencyHints(currentPeerConnection)
+           
+           // ✅ 发送新的 Answer
+           await streamingService.sendAnswer({
+-            sessionId: webrtcSessionIdRef.current,
++            sessionId: webrtcSessionIdValue,
+             sdp: answer.sdp || '',
+             type: 'answer',
+           })
+@@ -2178,6 +2201,7 @@
+       streamingHubService.onIceRestartOffer = handleIceRestartOffer
+       
+       peerConnection.oniceconnectionstatechange = () => {
++        if (!isCurrent()) return
+         const state = peerConnection.iceConnectionState
+         const connectionState = peerConnection.connectionState
+         const signalingState = peerConnection.signalingState
+@@ -2219,7 +2243,7 @@
+           if (iceRestartTimeoutRef.current !== null) {
+             window.clearTimeout(iceRestartTimeoutRef.current)
+           }
+-          iceRestartTimeoutRef.current = window.setTimeout(() => {
++          iceRestartTimeoutRef.current = setTimeout(() => {
+             if (peerConnection.iceConnectionState === 'failed' || 
+                 peerConnection.iceConnectionState === 'disconnected') {
+               console.log('🔄 ICE 连接持续失败，触发 ICE Restart')
+@@ -2259,7 +2283,7 @@
+           if (iceRestartTimeoutRef.current !== null) {
+             window.clearTimeout(iceRestartTimeoutRef.current)
+           }
+-          iceRestartTimeoutRef.current = window.setTimeout(() => {
++          iceRestartTimeoutRef.current = setTimeout(() => {
+             if (peerConnection.iceConnectionState === 'disconnected' || 
+                 peerConnection.iceConnectionState === 'failed') {
+               const disconnectedDuration = iceDisconnectedTimeRef.current ? Date.now() - iceDisconnectedTimeRef.current : 0
+@@ -2341,6 +2365,7 @@
+       const MAX_POLL_DURATION_MS = 8000 // 最多查询 8 秒
+       
+       const checkBackendIceCandidates = async (): Promise<boolean> => {
++        if (!isCurrent()) return false
+         // 检查连接状态，如果已连接则无需继续查询
+         if (peerConnection.iceConnectionState === 'connected' || peerConnection.iceConnectionState === 'completed') {
+           console.log('✅ ICE 连接已建立，停止查询后端 Candidate')
+@@ -2495,8 +2520,23 @@
+         )
+       }
+ 
++      assertCurrent()
++      const connectedUntil = Date.now() + 30000
++      while (peerConnection.connectionState !== 'connected') {
++        assertCurrent()
++        if (Date.now() >= connectedUntil || peerConnection.connectionState === 'failed' || peerConnection.connectionState === 'closed') throw new Error('新 WebRTC 连接失败，原 PS5 会话保留')
++        await new Promise(resolve => window.setTimeout(resolve, 100))
++      }
++      // Server validates its own connected state and the exact generation before switching receiver.
++      await streamingService.commitBrowser(webrtcSessionIdValue)
++      switchCommitted = true
++      assertCurrent()
++      await controllerService.disconnect()
++      await streamingHubService.disconnect()
++      assertCurrent()
++      await connectController(sessionId)
+       isStreamBoundRef.current = true
+-      console.log('🔗 WebRTC 会话已绑定远程流')
++      console.log('🔗 WebRTC 会话已安全接管远程流')
+ 
+       if (isRebuild) {
+         // 串流已切到新连接，再关闭旧连接（服务端发现串流仍被使用，不会停止 PS5 会话）
+@@ -2520,8 +2560,7 @@
+         }
+       }
+ 
+-      console.log('🎮 准备连接控制器，Session ID:', sessionId)
+-      await connectController(sessionId)
++      console.log('🎮 控制器已在接管提交后连接，Session ID:', sessionId)
+ 
+       gamepadEnabledRef.current = true
+       console.log('✅ 手柄输入已启用')
+@@ -2536,7 +2575,8 @@
+ 
+       startStickProcessing()
+     } catch (error) {
+-      if (isRebuild) {
++      if (!isCurrent()) return
++      if (isRebuild && !switchCommitted) {
+         // 重建失败：丢弃新连接，继续使用旧连接，稍后可再次尝试
+         console.error('❌ WebRTC 连接重建失败，保留原连接:', error)
+         const failedPeerConnection = peerConnectionRef.current
+@@ -2544,12 +2584,23 @@
+         if (failedPeerConnection !== previousPeerConnection) {
+           retirePeerConnection(failedPeerConnection, failedWebrtcSessionId !== previousWebrtcSessionId ? failedWebrtcSessionId : null)
+         }
++        attemptRef.current = previousAttempt
++        const oldConnected = previousPeerConnection?.connectionState === 'connected'
++        setIsConnected(oldConnected)
++        isConnectedRef.current = oldConnected
++        setConnectionState(oldConnected ? t('streaming.connection.state.connected') : t('streaming.connection.state.disconnected'))
++        setIsConnecting(false)
++        if (reuseRemotePlaySessionId) rememberLease(reuseRemotePlaySessionId, previousLease)
++        if (videoRef.current && previousMedia) videoRef.current.srcObject = previousMedia
+         peerConnectionRef.current = previousPeerConnection
+         webrtcSessionIdRef.current = previousWebrtcSessionId
+         setWebrtcSessionId(previousWebrtcSessionId)
+-        isStreamBoundRef.current = true
++        isStreamBoundRef.current = previousFlags.streamBound
++        hasVideoTrackRef.current = previousFlags.videoTrack
++        initialKeyframeRequestedRef.current = previousFlags.initialKeyframe
+         return
+       }
++      if (error instanceof DOMException && error.name === 'AbortError') { setIsConnecting(false); return }
+ 
+       console.error('连接失败:', error)
+       // 连接失败，更新状态显示在顶栏，不再显示弹出提示
+@@ -2580,7 +2631,7 @@
+       
+       disconnect()
+     } finally {
+-      setIsConnecting(false)
++      if (isCurrent()) setIsConnecting(false)
+     }
+   }, [
+     connectController,
+@@ -3003,8 +3054,8 @@
+ 
+   useEffect(() => {
+     if (hostId && !isConnected && !isConnecting && !hasAttemptedInitialConnectRef.current) {
+-      hasAttemptedInitialConnectRef.current = true
+       const timer = setTimeout(() => {
++        hasAttemptedInitialConnectRef.current = true;
+         connect()
+       }, 500)
+       return () => clearTimeout(timer)
+@@ -3028,6 +3079,7 @@
+     connectionState,
+     connect,
+     disconnect,
++    endRemoteSession,
+     connectionStats,
+     isStatsMonitoringEnabled: isStatsEnabled,
+     setStatsMonitoring,
+--- a/RemotePlay.Web/src/pages/streaming/index.tsx
++++ b/RemotePlay.Web/src/pages/streaming/index.tsx
+@@ -74,6 +74,7 @@
+     connectionState,
+     connect,
+     disconnect,
++    endRemoteSession,
+     connectionStats,
+     isStatsMonitoringEnabled,
+     setStatsMonitoring,
+@@ -93,11 +94,7 @@
+         variant: 'destructive',
+         duration: 3000, // 3秒后自动消失
+       })
+-      // 延迟导航，让用户看到提示但不会太久
+-      setTimeout(() => {
+-        disconnect()
+-        navigate('/devices')
+-      }, 3000)
++      // Stay on the page: a delayed navigation must never tear down a replacement connection.
+     },
+   })
+ 
+@@ -478,6 +475,7 @@
+         <StreamingStatsOverlay stats={connectionStats} />
+       )}
+ 
++      {isConnected && <button type="button" className="fixed bottom-4 right-4 z-[150] rounded bg-red-800 px-3 py-2 text-white" onClick={() => { void endRemoteSession().catch(error => toast({ title: '结束会话失败', description: String(error), variant: 'destructive' })) }}>结束 PS5 会话</button>}
+       {/* 卡顿提示图标 - 右上角闪烁 */}
+       {isConnected && isStalling && (
+         <div 
+--- a/RemotePlay.Web/src/service/api-client.ts
++++ b/RemotePlay.Web/src/service/api-client.ts
+@@ -1,3 +1,4 @@
++import { resourceLease } from './lifecycle-lease'
+ import { invalidateAuth, isAuthErrorMessage } from '@/utils/auth-invalidation'
+ import { getAccessToken } from '@/utils/auth-storage'
+ import { refreshAccessToken } from '@/utils/token-refresh'
+@@ -45,7 +46,7 @@
+   response: Response,
+   requestInit: RequestInit
+ ): Promise<{ unauthorizedStatus: boolean; data: ApiResponse<T> | null; emptyUnauthorized: boolean }> {
+-  const unauthorizedStatus = response.status === 401 || response.status === 403
++  const unauthorizedStatus = response.status === 401
+ 
+   if (response.status === 204 && requestInit.method === 'OPTIONS') {
+     return {
+@@ -142,6 +143,7 @@
+   endpoint: string,
+   options: RequestInit = {}
+ ): Promise<ApiResponse<T>> {
++  options = { ...options, headers: { 'X-PSRP-Lease': resourceLease(endpoint, options.body), ...(options.headers as Record<string, string>) } }
+   const url = `${API_BASE_URL}${endpoint}`
+   const skipRefresh = isAuthRefreshEndpoint(endpoint)
+ 
+@@ -194,7 +196,7 @@
+         invalidateAuth(errorMsg || `接口 ${endpoint} 返回未授权`)
+       }
+ 
+-      throw new Error(errorMsg)
++      throw Object.assign(new Error(errorMsg), { status: response.status, response: errorResponse })
+     }
+ 
+     const normalized = normalizeSuccessResponse(data)
+--- a/RemotePlay.Web/src/service/controller.service.ts
++++ b/RemotePlay.Web/src/service/controller.service.ts
+@@ -1,3 +1,4 @@
++import { currentLease } from './lifecycle-lease'
+ import * as signalR from '@microsoft/signalr'
+ import {
+   ControllerLightbarEvent,
+@@ -107,7 +108,7 @@
+ 
+       console.log('🔌 正在连接 SignalR 控制器...')
+ 
+-      const hubUrl = CONTROLLER_HUB_URL
++      const hubUrl = `${CONTROLLER_HUB_URL}?lease=${encodeURIComponent(currentLease())}`
+ 
+       this.connection = new signalR.HubConnectionBuilder()
+         .withUrl(hubUrl, {
+@@ -853,6 +854,7 @@
+   const token = localStorage.getItem('auth_token')
+   const headers: Record<string, string> = {
+     'Content-Type': 'application/json',
++    'X-PSRP-Lease': currentLease(),
+   }
+   if (token) {
+     headers.Authorization = `Bearer ${token}`
+@@ -891,6 +893,7 @@
+   const token = localStorage.getItem('auth_token')
+   const headers: Record<string, string> = {
+     'Content-Type': 'application/json',
++    'X-PSRP-Lease': currentLease(),
+   }
+   if (token) {
+     headers.Authorization = `Bearer ${token}`
+@@ -958,6 +961,7 @@
+   const token = localStorage.getItem('auth_token')
+   const headers: Record<string, string> = {
+     'Content-Type': 'application/json',
++    'X-PSRP-Lease': currentLease(),
+   }
+   if (token) {
+     headers.Authorization = `Bearer ${token}`
+--- /dev/null
++++ b/RemotePlay.Web/src/service/lifecycle-lease.ts
+@@ -0,0 +1,10 @@
++// Memory-only and page-scoped: never share browser-controller leases across tabs.
++let lease = ''
++const resources = new Map<string, string>()
++export const currentLease = () => lease
++export function rememberLease(id: string, token: string, activate = true) { if (activate) lease = token; resources.set(id, token) }
++export function resourceLease(endpoint: string, body?: BodyInit | null): string {
++  const text = endpoint + (typeof body === 'string' ? body : '')
++  for (const [id, token] of resources) if (text.includes(id)) return token
++  return lease
++}
+--- a/RemotePlay.Web/src/service/streaming-hub.service.ts
++++ b/RemotePlay.Web/src/service/streaming-hub.service.ts
+@@ -1,3 +1,4 @@
++import { currentLease } from './lifecycle-lease'
+ import * as signalR from '@microsoft/signalr'
+ 
+ const DEFAULT_API_BASE_URL = `${window.location.origin}/api`
+@@ -64,7 +65,7 @@
+     }
+ 
+     const connection = new signalR.HubConnectionBuilder()
+-      .withUrl(STREAMING_HUB_URL, {
++      .withUrl(`${STREAMING_HUB_URL}?lease=${encodeURIComponent(currentLease())}`, {
+         accessTokenFactory: () => localStorage.getItem('auth_token') || '',
+         transport: signalR.HttpTransportType.WebSockets | signalR.HttpTransportType.LongPolling,
+       })
+--- a/RemotePlay.Web/src/service/streaming.service.ts
++++ b/RemotePlay.Web/src/service/streaming.service.ts
+@@ -1,4 +1,5 @@
+ import { apiRequest, type ApiResponse } from './api-client'
++import { currentLease, rememberLease } from './lifecycle-lease'
+ 
+ // WebRTC Offer 请求
+ export interface WebRTCOfferRequest {
+@@ -89,13 +90,16 @@
+     payload?: WebRTCOfferRequest
+   ): Promise<ApiResponse<WebRTCOfferResponse>> => {
+     const hasPayload = payload && Object.keys(payload).length > 0
+-    return apiRequest<WebRTCOfferResponse>('/webrtc/offer', {
++    const token = currentLease()
++    const response = await apiRequest<WebRTCOfferResponse>('/webrtc/offer', {
+       method: 'POST',
+       headers: {
+         'Content-Type': 'application/json',
+       },
+       body: hasPayload ? JSON.stringify(payload) : undefined,
+     })
++    if (response.data) rememberLease(response.data.sessionId, token, false)
++    return response
+   },
+ 
+   /**
+@@ -136,11 +140,36 @@
+   /**
+    * 从 Host ID 创建或获取 Remote Play Session
+    */
+-  startSession: async (hostId: string): Promise<ApiResponse<RemotePlaySession>> => {
+-    return apiRequest<RemotePlaySession>(`/playstation/start-session?hostId=${encodeURIComponent(hostId)}`, {
+-      method: 'POST',
+-    })
+-  },
++  startSession: async (hostId: string, beforeCreate?: () => Promise<boolean>, isCurrent: () => boolean = () => true): Promise<ApiResponse<RemotePlaySession>> => {
++    const assertCurrent = () => { if (!isCurrent()) throw new DOMException('连接操作已过期', 'AbortError') }
++    const url = `/playstation/start-session?hostId=${encodeURIComponent(hostId)}`
++    const attempt = async (suffix: string): Promise<ApiResponse<RemotePlaySession>> => {
++      try { const result = await apiRequest<RemotePlaySession>(url + suffix, { method: 'POST' }); assertCurrent(); return result }
++      catch (error) {
++        assertCurrent()
++        const conflict = error as Error & { status?: number; response?: { generation?: number; errorMessage?: string } }
++        if (conflict.status !== 409 || !Number.isSafeInteger(conflict.response?.generation)) throw error
++        if (!window.confirm(conflict.response?.errorMessage || '此 PS5 已有会话，是否确认接管？取消不影响旧连接。'))
++          throw new DOMException('已取消接管，原连接保持不变', 'AbortError')
++        // One CAS attempt only. A newer generation requires a fresh explicit confirmation.
++        return apiRequest<RemotePlaySession>(url + `&confirmedGeneration=${conflict.response!.generation}`, { method: 'POST' })
++      }
++    }
++    let response = await attempt('&probeOnly=true')
++    assertCurrent()
++    if (response.data?.needsConsoleStart) {
++      if (beforeCreate && !await beforeCreate()) throw new Error('设备未就绪')
++      assertCurrent()
++      response = await attempt('')
++    }
++    assertCurrent()
++    if (response.data?.token) rememberLease(response.data.id, response.data.token)
++    if (response.data?.settingsNotice) window.alert(response.data.settingsNotice)
++    return response
++  },
++
++  commitBrowser: async (sessionId: string): Promise<ApiResponse<boolean>> =>
++    apiRequest<boolean>(`/webrtc/session/${encodeURIComponent(sessionId)}/commit`, { method: 'POST' }),
+ 
+   /**
+    * 连接 WebRTC Session 到 Remote Play Session
+--- /dev/null
++++ b/RemotePlay.Web/tests/README-lifecycle.md
+@@ -0,0 +1,59 @@
++# Lifecycle regression tests (no PS5)
++
++Production owner is `ClaimTypes.NameIdentifier`. A lease is memory-only per browser page; `generation` confirms a compare-and-swap prepare, and `X-PSRP-Lease` authorizes the corresponding peer/controller. Preparing never switches the receiver. `/webrtc/session/{id}/commit` requires a bound, actually connected server peer and switches under the host gate. Browser DELETE is not console stop. `/playstation/stop-session` is the explicit owner/current-controller operation.
++
++Configuration: `RemotePlay:BrowserGraceSeconds` / environment `RemotePlay__BrowserGraceSeconds`, default 60 (clamped 1–3600). Initial sessions without a valid browser and disconnected sessions expire; pending offers cannot renew this deadline. Cleanup checks once per second.
++
++## Local commands
++
++From `psrp/source`:
++
++```sh
++../sdk/dotnet run --project RemotePlay.RegressionTests
++# Optional isolated application STUN test; DNS/STUN only, no PS5:
++PSRP_RUN_STUN_INTEGRATION=1 ../sdk/dotnet run --project RemotePlay.RegressionTests -- network_real_application_ICE
++```
++
++The existing H264 regression requires Playwright/Chromium and Node `h264-profile-level-id`. In the current workspace use the staging `test-venv/bin` on PATH and `test-tools/node_modules:RemotePlay.Web/node_modules` on NODE_PATH. The default suite has 40 tests (the original 37 plus two receiver atomicity paths and one multi-tick slow cleanup); the network integration is opt-in, unchanged.
++
++Start these **test-only loopback processes** in separate terminals:
++
++```sh
++# Source root. New process required for each backend integration run.
++../sdk/dotnet run --project RemotePlay.RegressionTests -- --lifecycle-http-server
++# RemotePlay.Web:
++node node_modules/vite/bin/vite.js --host 127.0.0.1 --port 5187 --strictPort
++```
++
++Run the Python browser tests under the staging Playwright venv:
++
++- `browser_lifecycle_test.py`: native Chinese confirm/cancel against simulated API.
++- `browser_stale_async_test.py`: a delayed old start cannot overwrite the new lease.
++- `browser_hook_test.py`: real React hook/provider/UI, auto-connect, cancel and failed replacement, browser timers advanced 15 seconds, no discover/wake/stop calls before consent or during cleanup.
++- `browser_backend_integration.py`: real production services/API client, actual MVC/filter/EF permissions, real loopback Chromium↔SIPSorcery WebRTC and actual SignalR WebSockets; fake console session/media transport. It covers failed new answer retaining A, A→B→C preparation, stale generation, old HTTP/delete/SignalR input/disconnect, revoked UserDevice, same-peer release, reattach without console reconnect, and explicit stop of console TCP+media. The default fixture's PS5 start operation always throws; the explicitly selected fresh fixture only increments an in-memory fake-console counter. Test auth creates NameIdentifier claims only in this test executable, not in production.
++
++For PWA tests, serve the published staging `www` with `python tests/artifact_server.py /absolute/staging/www`, then run `browser_sw_test.py`. This test server substitutes harmless network counters for diagnostic/API navigation, so it never executes the retained diagnostic player's scripts.
++
++Do not run production Program or deploy these artifacts for these tests. Only the `RemotePlay` project is published; the fake host, fake authentication scheme and React harness are excluded from production artifacts.
++
++For Node 18 builds, enable the runtime's webcrypto global explicitly:
++
++```sh
++node node_modules/typescript/bin/tsc --noEmit
++node --experimental-global-webcrypto node_modules/vite/bin/vite.js build
++```
++
++## Independent-review blocking fixes (no PS5)
++
++- `review_receiver_atomic_pipeline` / `review_receiver_atomic_legacy`: dedicated threads pause A removal at an existing log call inside the real route update, then attempt B installation. B must block until A leaves the entire receiver operation (not just its reference assignment). After joining, stream and pipeline/output or AVHandler routing references equal B; actual OutputPipeline audio (1 packet) / parsed AVHandler audio via its jitter buffer (6 packets) reach only B. A's later disconnect is harmless. The pause uses reflection to inject a logger into isolated real routing objects; no production test hook or console connection is added. Pre-fix code deterministically fails the overlapping-operation assertion even though this particular pause point is after its sink assignment.
++- `review_reaper_slow_multitick`: real slow StopStream task spans four later SweepAsync invocations (the same entry point dispatched each runtime tick); each invocation cleans a newly expired independent host, while the slow host has exactly one media stop in flight and no console stop until released. Afterwards both stops are exactly once. Existing production reaper already passes; no reaper code change was needed.
++- `review_tap_range`: TAP rejects -1, 1001 and int.MaxValue; valid range 0–1000 ms.
++- `review_tap_gate` / `review_tap_cancel_replacement`: HTTP dispatch does not hold HostGate over tap waits; actual shared button path cancels promptly, releases a still-current pressed button, and cannot release a replacement controller's button.
++- `review_reaper_busy_host`: a held host gate is skipped rather than stalling the sweep. Runtime ticks dispatch independent per-host work; a slow cleanup holds only its host's gate.
++- `review_revocation_media`: revoked active peer is removed, receiver detached, lease invalidated, console retained until exactly 60 seconds of fake-clock grace, then media/TCP stop once.
++- `review_wake_permission`: authenticated account without active UserDevice gets 403 before the wake action runs.
++- `browser_rebuild_cancel_test.py`: restart default loopback fixture first. Real React hook + real Chromium↔SIPSorcery peer. Cancel same-page `connect({reuseRemotePlaySessionId})` and fail a confirmed new offer; old attempt/peer/flags remain, callback works, guarded playback timer resumes over 15 seconds. Read-only hook-ref instrumentation is applied by the test's browser route, not shipped code. This directly exercises the same rebuild connect branch invoked by decoder-stall recovery; it does not synthesize a real hardware decoder stall.
++- Updated `browser_backend_integration.py`: real SignalR 1000ms tap + concurrent MVC GET, invalid HTTP tap=400, revoked wake=403, sweep removes all peers/current lease/media receiver, restoration/reattach and explicit stop.
++- `browser_fresh_session_test.py`: restart fixture with `../sdk/dotnet run --no-build --project RemotePlay.RegressionTests -- --lifecycle-fresh-http-server` first. Starts with no lifecycle entry, performs probe→frontend prepare callback→MVC fresh start→real loopback offer/answer/bind/commit→release→reattach→explicit stop. Console start is a strictly in-memory fake, never a production transport. Expected counters: starts=1, stops=1, mediaStops=1. No real discovery/wake or PS5 connection is made.
++
++Use a new fixture process for each backend, rebuild-hook, or fresh-session test; they intentionally mutate in-memory lease and console state. Vite remains loopback port 5187; fixtures remain loopback port 5188. Original Playwright scripts and SW checks remain runnable as above. No production Program or PS5 transport should be started.
+--- /dev/null
++++ b/RemotePlay.Web/tests/artifact_server.py
+@@ -0,0 +1,20 @@
++from http.server import ThreadingHTTPServer,SimpleHTTPRequestHandler
++from pathlib import Path
++import json,sys
++ROOT=(Path(sys.argv[1]) if len(sys.argv)>1 else Path(__file__).resolve().parent/'www').resolve()
++class Handler(SimpleHTTPRequestHandler):
++    diagnostic_count=0
++    def translate_path(self,path):
++        path=path.split('?',1)[0]
++        prefix='/app/psrp-web/'
++        if path.startswith(prefix):path=path[len(prefix):]
++        candidate=(ROOT/path.lstrip('/')).resolve()
++        return str(candidate if candidate.is_relative_to(ROOT) else ROOT/'__denied__')
++    def do_GET(self):
++        if '/diagnostics/api/video.html' in self.path or '/api/cache-probe' in self.path:
++            Handler.diagnostic_count+=1
++            data=json.dumps({'network':True,'count':Handler.diagnostic_count}).encode()
++            self.send_response(200);self.send_header('Content-Type','application/json');self.send_header('Cache-Control','no-store');self.end_headers();self.wfile.write(data);return
++        super().do_GET()
++    def log_message(self,format,*args):pass
++ThreadingHTTPServer(('127.0.0.1',5189),Handler).serve_forever()
+--- /dev/null
++++ b/RemotePlay.Web/tests/browser_backend_integration.py
+@@ -0,0 +1,131 @@
++import asyncio,json
++from playwright.async_api import async_playwright
++
++BASE='http://127.0.0.1:5188'
++VITE='http://127.0.0.1:5187/app/psrp-web/'
++CHROME=__import__('os').environ.get('CHROMIUM_PATH')
++async def main():
++ async with async_playwright() as p:
++  browser=await p.chromium.launch(executable_path=CHROME,headless=True,args=['--no-sandbox'])
++  page=await browser.new_page(); calls=[]; dialogs=[]
++  await page.context.grant_permissions(['local-network-access'])
++  page.on('console',lambda message: print('BROWSER',message.type,message.text) if message.type=='error' else None)
++  async def proxy(route):
++   path=route.request.url.split('/api/',1)[1]
++   response=await route.fetch(url=BASE+'/api/'+path)
++   calls.append({'path':path,'method':route.request.method,'status':response.status})
++   await route.fulfill(response=response)
++  await page.route('**/api/**',proxy)
++  await page.route('**/lifecycle-harness.html',lambda r:r.fulfill(content_type='text/html',body='<html><title>Lifecycle integration</title></html>'))
++  async def dialog(d):
++   dialogs.append({'type':d.type,'message':d.message})
++   await d.accept()
++  page.on('dialog',dialog)
++  await page.goto(VITE+'lifecycle-harness.html')
++  await page.evaluate("localStorage.setItem('auth_token','alice')")
++  fixture=await (await page.request.get(BASE+'/test/state')).json()
++  remote=fixture['remoteId'];old=fixture['initialToken']
++  await page.evaluate('''async ({remote,old}) => {
++   const separator=String.fromCharCode(30);window.hubs={};let serial=0;
++   window.openTestHub=async (name,lease)=>{
++    const ws=new WebSocket('ws://127.0.0.1:5188/hubs/controller?access_token=alice&lease='+lease);
++    const pending=new Map();let handshake;
++    const ready=new Promise((resolve,reject)=>{handshake=resolve;ws.onerror=()=>reject(new Error('hub websocket failed'))});
++    ws.onopen=()=>ws.send(JSON.stringify({protocol:'json',version:1})+separator);
++    ws.onmessage=e=>{for(const text of e.data.split(separator).filter(Boolean)){const m=JSON.parse(text);if(!m.type)handshake();if(m.type===3){pending.get(m.invocationId)?.(m);pending.delete(m.invocationId)}}};
++    await ready;window.hubs[name]={ws,pending};
++   };
++   window.invokeTestHub=(name,target,args)=>new Promise((resolve,reject)=>{
++    const h=window.hubs[name],id=String(++serial);h.pending.set(id,resolve);h.ws.send(JSON.stringify({type:1,invocationId:id,target,arguments:args})+separator);setTimeout(()=>reject(new Error('hub completion timeout')),4000);
++   });
++   await window.openTestHub('A',old);
++   const result=await window.invokeTestHub('A','ConnectController',[remote]);if(result.error)throw new Error(result.error);
++  }''',{'remote':remote,'old':old})
++  async def http(path,owner='alice',lease=old,method='POST',data=None):
++   headers={'Authorization':'Bearer '+owner,'X-PSRP-Lease':lease}
++   return await page.request.fetch(BASE+'/api/'+path,method=method,headers=headers,data=data)
++  # Real SignalR tap waits outside HostGate; concurrent HTTP authorization stays responsive.
++  await page.evaluate("remote=>{window.tap=window.invokeTestHub('A','Button',[remote,'CROSS','tap',1000])}",remote)
++  await page.wait_for_timeout(100)
++  import time
++  begin=time.monotonic();tap_probe=await http('playstation/get-session?sessionId='+remote,method='GET')
++  tap_gate_elapsed=time.monotonic()-begin
++  assert tap_probe.status==200 and tap_gate_elapsed<0.7,(tap_probe.status,tap_gate_elapsed)
++  tap_result=await page.evaluate('window.tap');assert not tap_result.get('error'),tap_result
++  invalid_tap=await http('playstation/controller/button',data={'sessionId':remote,'button':'CROSS','action':'tap','delayMs':-1});assert invalid_tap.status==400,await invalid_tap.text()
++  # Cross-owner has active UserDevice but still cannot reuse or inspect Alice's console.
++  r=await http('playstation/start-session?hostId=ps5',owner='bob');assert r.status==403,await r.text();assert remote not in await r.text()
++  r=await page.request.post(BASE+'/api/webrtc/offer',data={'remotePlaySessionId':remote});assert r.status==401,r.status
++  r=await http('playstation/start-session?hostId=ps5&confirmedGeneration=0');assert r.status==409,r.status
++  # A failed new answer must not replace the existing controller or reconnect the console.
++  failed=await page.evaluate('''async()=>{
++   const {streamingService:s}=await import('/app/psrp-web/src/service/streaming.service.ts');
++   const start=await s.startSession('ps5');const offer=await s.createOffer({remotePlaySessionId:start.data.id});
++   try {await s.sendAnswer({sessionId:offer.data.sessionId,sdp:'v=0\\r\\n',type:'answer'});return {unexpected:true}}
++   catch(e){return {id:offer.data.sessionId,status:e.status}}
++  }''')
++  assert failed.get('status')==400,failed
++  r=await http('playstation/get-session?sessionId='+remote,method='GET');assert r.status==200,r.status
++  alive=await page.evaluate('remote=>window.invokeTestHub(\'A\',\'SetSticks\',[remote,0,0,0,0])',remote);assert not alive.get('error'),alive
++  # Real browser uses production frontend service + MVC/filter/backend + local real WebRTC.
++  outcome=await page.evaluate('''async () => { window.connectFixture=async()=>{
++   const {streamingService:s}=await import('/app/psrp-web/src/service/streaming.service.ts');
++   const start=await s.startSession('ps5',async()=>{throw new Error('must never reconnect/wake existing PS5')});
++   const remote=start.data.id;
++   const offer=await s.createOffer({remotePlaySessionId:remote});
++   const id=offer.data.sessionId;
++   const pc=new RTCPeerConnection({iceServers:[]}); window.testPeer=pc;
++   await pc.setRemoteDescription({type:'offer',sdp:offer.data.sdp});
++   await pc.setLocalDescription(await pc.createAnswer());
++   if(pc.iceGatheringState!=='complete') await new Promise(resolve=>{pc.addEventListener('icegatheringstatechange',()=>{if(pc.iceGatheringState==='complete')resolve()});setTimeout(resolve,3000)});
++   await s.sendAnswer({sessionId:id,sdp:pc.localDescription.sdp,type:'answer'});
++   await s.connectToRemotePlaySession(id,remote);
++   const end=Date.now()+15000;
++   while(pc.connectionState!=='connected'&&Date.now()<end)await new Promise(r=>setTimeout(r,50));
++   if(pc.connectionState!=='connected')throw new Error('local real ICE failed: '+pc.connectionState);
++   await new Promise(r=>setTimeout(r,150));
++   const commit=await s.commitBrowser(id);
++   window.fixtureBrowserId=id;
++   return {remote,id,connected:pc.connectionState,committed:commit.success};
++  };return window.connectFixture()}''')
++  assert outcome['committed'],outcome
++  hub_results=await page.evaluate('''async remote=>{
++   const stale=await window.invokeTestHub('A','SetSticks',[remote,0,0,0,0]);
++   const {currentLease}=await import('/app/psrp-web/src/service/lifecycle-lease.ts');
++   await window.openTestHub('B',currentLease());
++   const current=await window.invokeTestHub('B','SetSticks',[remote,0,0,0,0]);
++   const lateDisconnect=await window.invokeTestHub('A','DisconnectController',[remote]);
++   return {stale,current,lateDisconnect};
++  }''',remote)
++  assert hub_results['stale'].get('error') and hub_results['lateDisconnect'].get('error'),hub_results
++  assert not hub_results['current'].get('error'),hub_results
++  # Stale A cannot stop, input or bind even though the JWT owner is the same.
++  for path in ['playstation/stop-session?sessionId='+remote,'playstation/controller/start?sessionId='+remote]:
++   r=await http(path);assert r.status==403,(path,r.status,await r.text())
++  r=await http('webrtc/session/'+outcome['id'],lease=old,method='DELETE');assert r.status==403,r.status
++  state=await (await page.request.get(BASE+'/test/state')).json();assert state['active'] and state['starts']==0 and state['stops']==0,state
++  # Revocation also gates existing SignalR input and browser DELETE, not only start.
++  await page.request.post(BASE+'/test/revoke')
++  revoked_hub=await page.evaluate('remote=>window.invokeTestHub(\'B\',\'SetSticks\',[remote,0,0,0,0])',remote);assert revoked_hub.get('error'),revoked_hub
++  denied_delete=await page.evaluate('''async()=>{const {streamingService:s}=await import('/app/psrp-web/src/service/streaming.service.ts');try{await s.deleteSession(window.fixtureBrowserId);return 200}catch(e){return e.status}}''');assert denied_delete==403,denied_delete
++  revoked_wake=await http('playstation/wakeup?hostId=ps5');assert revoked_wake.status==403,await revoked_wake.text()
++  revoked_media=await(await page.request.post(BASE+'/test/sweep')).json()
++  assert revoked_media=={'peers':0,'current':None,'receiverAttached':False},revoked_media
++  await page.evaluate('window.testPeer.close()')
++  await page.request.post(BASE+'/test/restore')
++  restored_browser=await page.evaluate('window.connectFixture()');assert restored_browser['committed'],restored_browser
++  # Same browser release must not end the console.
++  await page.evaluate("async()=>{const {streamingService:s}=await import('/app/psrp-web/src/service/streaming.service.ts');await s.deleteSession(window.fixtureBrowserId);window.testPeer.close()}")
++  state=await (await page.request.get(BASE+'/test/state')).json();assert state['active'] and state['stops']==0,state
++  released_state=dict(state)
++  # Reattach without a PS5 reconnect, then explicitly end the NAS-console session.
++  final_browser=await page.evaluate('window.connectFixture()');assert final_browser['committed'],final_browser
++  await page.evaluate('''async remote=>{const {apiRequest}=await import('/app/psrp-web/src/service/api-client.ts');await apiRequest('/playstation/stop-session?sessionId='+remote,{method:'POST'});window.testPeer.close()}''',remote)
++  final_state=await (await page.request.get(BASE+'/test/state')).json()
++  assert final_state['stops']==1 and final_state['mediaStops']==1 and final_state['starts']==0 and not final_state['active'],final_state
++  # Revocation is checked on every request, not just start.
++  await page.request.post(BASE+'/test/revoke')
++  r=await http('playstation/start-session?hostId=ps5');assert r.status==403,r.status
++  print(json.dumps({'outcome':outcome,'tapConcurrentHttpSeconds':tap_gate_elapsed,'invalidTap':invalid_tap.status,'dialogs':dialogs,'httpCalls':calls,'releasedState':released_state,'finalState':final_state,'hubResults':hub_results,'revokedHub':revoked_hub,'revokedMedia':revoked_media,'revokedWake':revoked_wake.status,'failedNewAnswer':failed,'crossOwner':'403 without session ID','anonymous':'401','staleGeneration':'409','lateStopInputDelete':'403','revocation':'403'},ensure_ascii=False,indent=2))
++  await browser.close()
++asyncio.run(main())
+--- /dev/null
++++ b/RemotePlay.Web/tests/browser_fresh_session_test.py
+@@ -0,0 +1,47 @@
++import asyncio,json
++from playwright.async_api import async_playwright
++BASE='http://127.0.0.1:5188'
++VITE='http://127.0.0.1:5187/app/psrp-web/'
++CHROME=__import__('os').environ.get('CHROMIUM_PATH')
++async def main():
++ async with async_playwright() as p:
++  browser=await p.chromium.launch(executable_path=CHROME,headless=True,args=['--no-sandbox'])
++  page=await browser.new_page();await page.context.grant_permissions(['local-network-access']);calls=[]
++  async def proxy(route):
++   path=route.request.url.split('/api/',1)[1];r=await route.fetch(url=BASE+'/api/'+path);calls.append({'path':path,'status':r.status});await route.fulfill(response=r)
++  await page.route('**/api/**',proxy)
++  await page.route('**/fresh-harness.html',lambda r:r.fulfill(content_type='text/html',body='<title>Fake-console fresh integration</title>'))
++  await page.goto(VITE+'fresh-harness.html');await page.evaluate("localStorage.setItem('auth_token','alice')")
++  page.on('dialog',lambda d:d.accept())
++  before=await(await page.request.get(BASE+'/test/state')).json();assert before['generation'] is None and before['starts']==0,before
++  outcome=await page.evaluate('''async () => { window.connectFixture=async()=>{
++   const {streamingService:s}=await import('/app/psrp-web/src/service/streaming.service.ts');
++   const start=await s.startSession('ps5',async()=>{window.prepares=(window.prepares||0)+1;return true});
++   const remote=start.data.id;
++   const offer=await s.createOffer({remotePlaySessionId:remote});
++   const id=offer.data.sessionId;
++   const pc=new RTCPeerConnection({iceServers:[]}); window.testPeer=pc;
++   await pc.setRemoteDescription({type:'offer',sdp:offer.data.sdp});
++   await pc.setLocalDescription(await pc.createAnswer());
++   if(pc.iceGatheringState!=='complete') await new Promise(resolve=>{pc.addEventListener('icegatheringstatechange',()=>{if(pc.iceGatheringState==='complete')resolve()});setTimeout(resolve,3000)});
++   await s.sendAnswer({sessionId:id,sdp:pc.localDescription.sdp,type:'answer'});
++   await s.connectToRemotePlaySession(id,remote);
++   const end=Date.now()+15000;
++   while(pc.connectionState!=='connected'&&Date.now()<end)await new Promise(r=>setTimeout(r,50));
++   if(pc.connectionState!=='connected')throw new Error('local real ICE failed: '+pc.connectionState);
++   await new Promise(r=>setTimeout(r,150));
++   const commit=await s.commitBrowser(id);
++   window.fixtureBrowserId=id;
++   return {remote,id,connected:pc.connectionState,committed:commit.success};
++  };return window.connectFixture()}''')
++  assert outcome['committed'] and outcome['connected']=='connected',outcome
++  assert await page.evaluate('window.prepares')==1
++  remote=outcome['remote']
++  await page.evaluate("async()=>{const {streamingService:s}=await import('/app/psrp-web/src/service/streaming.service.ts');await s.deleteSession(window.fixtureBrowserId);window.testPeer.close()}")
++  released=await(await page.request.get(BASE+'/test/state')).json();assert released['starts']==1 and released['stops']==0,released
++  again=await page.evaluate('window.connectFixture()');assert again['committed'],again
++  await page.evaluate("async remote=>{const {apiRequest}=await import('/app/psrp-web/src/service/api-client.ts');await apiRequest('/playstation/stop-session?sessionId='+remote,{method:'POST'});window.testPeer.close()}",remote)
++  final=await(await page.request.get(BASE+'/test/state')).json();assert final['starts']==1 and final['stops']==1 and final['mediaStops']==1,final
++  print(json.dumps({'fresh':outcome,'released':released,'final':final,'calls':calls,'console':'explicit fake start; no PS5 transport'},ensure_ascii=False,indent=2))
++  await browser.close()
++asyncio.run(main())
+--- /dev/null
++++ b/RemotePlay.Web/tests/browser_hook_test.py
+@@ -0,0 +1,38 @@
++import asyncio,json
++from playwright.async_api import async_playwright
++CHROME=__import__('os').environ.get('CHROMIUM_PATH')
++async def main():
++ async with async_playwright() as p:
++  b=await p.chromium.launch(executable_path=CHROME,headless=True,args=['--no-sandbox'])
++  results=[]
++  for accept in [False,True]:
++   page=await b.new_page();calls=[];dialogs=[]
++   async def api(r):
++    url=r.request.url;calls.append(url)
++    if 'start-session' in url:
++     if 'confirmedGeneration=4' in url:await r.fulfill(json={'success':True,'data':{'id':'remote','token':'candidate','generation':5}})
++     else:await r.fulfill(status=409,json={'success':False,'generation':4,'errorMessage':'此 PS5 已有会话，是否确认接管？取消不影响原连接。'})
++    elif '/webrtc/offer' in url:await r.fulfill(status=502,json={'success':False,'errorMessage':'fixture: new WebRTC failed; old controller remains'})
++    else:await r.fulfill(status=500,json={'success':False,'errorMessage':'unexpected API call'})
++   async def dialog(d):
++    dialogs.append(d.message);await(d.accept() if accept else d.dismiss())
++   page.on('dialog',dialog)
++   await page.route('**/api/**',api)
++   await page.route('**/hook-test.html',lambda r:r.fulfill(content_type='text/html',body='<div id="root"></div><script type="module">import RefreshRuntime from "/app/psrp-web/@react-refresh";RefreshRuntime.injectIntoGlobalHook(window);window.$RefreshReg$=()=>{};window.$RefreshSig$=()=>type=>type;window.__vite_plugin_react_preamble_installed__=true;await import("/app/psrp-web/tests/lifecycle-hook-harness.tsx");</script>'))
++   await page.goto('http://127.0.0.1:5187/app/psrp-web/hook-test.html')
++   await page.wait_for_selector('#status')
++   await page.wait_for_function('document.querySelector("#status").textContent.includes("false")')
++   # Let the real initial-connect effect run, then advance browser timers deterministically.
++   await page.wait_for_timeout(1000)
++   await page.clock.install();await page.clock.run_for(15000)
++   assert dialogs, 'real hook did not request confirmation'
++   assert all('discover' not in u and 'wakeup' not in u and 'stop-session' not in u for u in calls),calls
++   expected=3 if accept else 1
++   assert len(calls)==expected,(calls,dialogs)
++   state=json.loads(await page.locator('#status').inner_text());assert state=={'connected':False,'connecting':False},state
++   await page.click('#disconnect');await page.clock.run_for(1000)
++   assert len(calls)==expected,'browser-only exit called stop or touched another lease'
++   results.append({'accepted':accept,'calls':calls,'dialogs':dialogs,'stateAfterTimers':state})
++   await page.close()
++  print(json.dumps(results,ensure_ascii=False,indent=2));await b.close()
++asyncio.run(main())
+--- /dev/null
++++ b/RemotePlay.Web/tests/browser_lifecycle_test.py
+@@ -0,0 +1,38 @@
++import asyncio, json, os
++from pathlib import Path
++from playwright.async_api import async_playwright
++
++async def main():
++    async with async_playwright() as p:
++        browser = await p.chromium.launch(executable_path=__import__('os').environ.get('CHROMIUM_PATH'), headless=True, args=['--no-sandbox'])
++        results=[]
++        for accepted in [False, True]:
++            page=await browser.new_page()
++            requests=[]; dialogs=[]
++            async def route(r):
++                requests.append(r.request.url)
++                if 'confirmedGeneration=7' in r.request.url:
++                    await r.fulfill(status=200,json={'success':True,'data':{'id':'remote','hostId':'ps5','token':'lease-B','generation':8}})
++                else:
++                    await r.fulfill(status=409,json={'success':False,'generation':7,'errorMessage':'此 PS5 已有会话。确认接管？取消不影响原连接。'})
++            async def dialog(d):
++                dialogs.append(d.message)
++                await (d.accept() if accepted else d.dismiss())
++            await page.route('**/api/playstation/start-session**',route)
++            await page.route('**/api/auth/**',lambda r:r.fulfill(status=200,json={'success':True,'data':{}}))
++            page.on('dialog',dialog)
++            await page.goto('http://127.0.0.1:5187/app/psrp-web/')
++            value=await page.evaluate('''async () => {
++                const m=await import('/app/psrp-web/src/service/streaming.service.ts');
++                try { const r=await m.streamingService.startSession('ps5'); return {success:r.success,id:r.data?.id}; }
++                catch(e) { return {name:e.name,error:e.message}; }
++            }''')
++            assert dialogs and 'PS5' in dialogs[0], f'missing actual Chinese confirmation: {value}'
++            assert len(requests)==(2 if accepted else 1),requests
++            if accepted: assert value['id']=='remote',value
++            else: assert value['name']=='AbortError',value
++            results.append({'case':'confirm' if accepted else 'cancel','requests':requests,'dialogs':dialogs,'result':value})
++            await page.close()
++        print(json.dumps(results,ensure_ascii=False,indent=2))
++        await browser.close()
++asyncio.run(main())
+--- /dev/null
++++ b/RemotePlay.Web/tests/browser_rebuild_cancel_test.py
+@@ -0,0 +1,64 @@
++"""Real React hook + real Chromium/loopback peer; read-only test instrumentation exposes hook refs."""
++import asyncio,json
++from playwright.async_api import async_playwright
++BASE='http://127.0.0.1:5188'
++VITE='http://127.0.0.1:5187/app/psrp-web/'
++CHROME=__import__('os').environ.get('CHROMIUM_PATH')
++async def main():
++ async with async_playwright() as p:
++  b=await p.chromium.launch(executable_path=CHROME,headless=True,args=['--no-sandbox'])
++  page=await b.new_page();await page.context.grant_permissions(['local-network-access']);calls=[];dialogs=[];logs=[];failing=False
++  page.on('console',lambda m:logs.append(m.text))
++  await page.add_init_script("""localStorage.setItem('auth_token','alice');window.testPeers=[];
++   const Native=window.RTCPeerConnection;window.RTCPeerConnection=class extends Native {constructor(c){super({...c,iceServers:[],iceCandidatePoolSize:0});window.testPeers.push(this)}};""")
++  async def proxy(route):
++   path=route.request.url.split('/api/',1)[1]
++   if failing and path=='webrtc/offer':
++    calls.append({'path':path,'status':502});await route.fulfill(status=502,json={'success':False,'errorMessage':'test replacement offer failure'});return
++   r=await route.fetch(url=BASE+'/api/'+path);calls.append({'path':path,'status':r.status});await route.fulfill(response=r)
++  await page.route('**/api/**',proxy)
++  async def instrument(route):
++   r=await route.fetch();body=await r.text();marker='const endRemoteSession ='
++   assert marker in body
++   body=body.replace(marker,"window.__hookSnapshot=()=>({attempt:attemptRef.current,bound:isStreamBoundRef.current,video:hasVideoTrackRef.current,keyframe:initialKeyframeRequestedRef.current,peer:peerConnectionRef.current,rtc:webrtcSessionIdRef.current}); "+marker,1)
++   await route.fulfill(response=r,body=body)
++  await page.route('**/src/hooks/use-streaming-connection.ts*',instrument)
++  await page.route('**/hook-test.html*',lambda r:r.fulfill(content_type='text/html',body='<div id="root"></div><script type="module">import R from "/app/psrp-web/@react-refresh";R.injectIntoGlobalHook(window);window.$RefreshReg$=()=>{};window.$RefreshSig$=()=>t=>t;window.__vite_plugin_react_preamble_installed__=true;await import("/app/psrp-web/tests/lifecycle-hook-harness.tsx");</script>'))
++  async def dialog(d):
++   dialogs.append({'type':d.type,'message':d.message});await(d.accept() if d.type!='confirm' or failing or sum(x['type']=='confirm' for x in dialogs)==1 else d.dismiss())
++  page.on('dialog',dialog)
++  fixture=await(await page.request.get(BASE+'/test/state')).json()
++  await page.goto(VITE+'hook-test.html?remote='+fixture['remoteId'])
++  try: await page.wait_for_function('window.__hookSnapshot?.().bound === true',timeout=30000)
++  except Exception:
++   print(json.dumps({'calls':calls,'dialogs':dialogs,'logs':[l for l in logs if '扳机' not in l][-35:]},ensure_ascii=False,indent=2));raise
++  await page.evaluate('window.before=window.__hookSnapshot()')
++  await page.clock.install()
++  await page.evaluate('''()=>{window.plays=0;const v=document.querySelector('video');Object.defineProperty(v,'readyState',{get:()=>2});Object.defineProperty(v,'paused',{get:()=>true});v.play=async()=>{window.plays++};window.before.peer.dispatchEvent(new Event('connectionstatechange'))}''')
++  count=len(calls)
++  await page.click('#rebuild')
++  await page.wait_for_timeout(500)
++  snapshot=await page.evaluate('''()=>{const a=window.before,b=window.__hookSnapshot();return {sameAttempt:a.attempt===b.attempt,samePeer:a.peer===b.peer,sameRtc:a.rtc===b.rtc,bound:b.bound,video:b.video,keyframe:b.keyframe,flagsRestored:a.bound===b.bound&&a.video===b.video&&a.keyframe===b.keyframe,peerState:b.peer.connectionState}}''')
++  assert sum(d['type']=='confirm' for d in dialogs)==2,dialogs
++  assert snapshot['sameAttempt'] and snapshot['samePeer'] and snapshot['sameRtc'] and snapshot['flagsRestored'],snapshot
++  cancel_calls=[c for c in calls[count:] if not c['path'].endswith('/keyframe') and c['path']!='webrtc/ice']
++  assert len(cancel_calls)==1 and 'start-session' in cancel_calls[0]['path'],calls[count:]
++  # A confirmed replacement whose new offer fails must preserve the same old attempt/peer too.
++  failing=True
++  await page.click('#rebuild');await page.wait_for_timeout(500)
++  failure_snapshot=await page.evaluate('''()=>{const a=window.before,b=window.__hookSnapshot();return {sameAttempt:a.attempt===b.attempt,samePeer:a.peer===b.peer,flagsRestored:a.bound===b.bound&&a.video===b.video&&a.keyframe===b.keyframe}}''')
++  assert all(failure_snapshot.values()),failure_snapshot
++  # The retained peer callback must still pass isCurrent(). Its connected callback also creates guarded timers.
++  before=sum('🔌 WebRTC 连接状态变化:' in l for l in logs)
++  await page.evaluate("window.before.peer.dispatchEvent(new Event('connectionstatechange'))")
++  await page.wait_for_timeout(100)
++  assert sum('🔌 WebRTC 连接状态变化:' in l for l in logs)==before+1,'old peer callback remains invalidated'
++  plays_before=await page.evaluate('window.plays')
++  await page.clock.run_for(15000)
++  timer_plays=await page.evaluate('window.plays')-plays_before
++  assert timer_plays>0,'retained attempt guarded playback timer never resumed'
++  assert await page.evaluate("window.before.peer.connectionState==='connected' && window.__hookSnapshot().bound"),'old peer/flags lost after timers'
++  state=json.loads(await page.locator('#status').inner_text());assert state=={'connected':True,'connecting':False},state
++  print(json.dumps({'snapshot':snapshot,'stateAfter15Seconds':state,'dialogs':dialogs,'oldCallbackActive':True,'guardedPlaybackTimerCalls':timer_plays,'peer':'real Chromium/loopback SIPSorcery','cancelCalls':cancel_calls,'failedReplacement':failure_snapshot,'rebuildCalls':calls[count:]},ensure_ascii=False,indent=2))
++  await page.close();await b.close()
++asyncio.run(main())
+--- /dev/null
++++ b/RemotePlay.Web/tests/browser_stale_async_test.py
+@@ -0,0 +1,24 @@
++import asyncio,json
++from playwright.async_api import async_playwright
++async def main():
++ async with async_playwright() as p:
++  b=await p.chromium.launch(executable_path=__import__('os').environ.get('CHROMIUM_PATH'),headless=True,args=['--no-sandbox'])
++  page=await b.new_page()
++  await page.route('**/lifecycle-harness.html',lambda r:r.fulfill(content_type='text/html',body='<html></html>'))
++  async def route(r):
++   slow='hostId=slow' in r.request.url
++   if slow:await asyncio.sleep(.4)
++   await r.fulfill(json={'success':True,'data':{'id':'remote','token':'old-A' if slow else 'new-B','generation':2}})
++  await page.route('**/api/playstation/start-session**',route)
++  await page.goto('http://127.0.0.1:5187/app/psrp-web/lifecycle-harness.html')
++  result=await page.evaluate('''async()=>{
++   const {streamingService:s}=await import('/app/psrp-web/src/service/streaming.service.ts');
++   const {currentLease}=await import('/app/psrp-web/src/service/lifecycle-lease.ts');
++   let active=true;
++   const a=s.startSession('slow',undefined,()=>active).then(()=> 'unexpected success',e=>e.name);
++   await s.startSession('fast');active=false;
++   return {oldResult:await a,current:currentLease()};
++  }''')
++  assert result=={'oldResult':'AbortError','current':'new-B'},result
++  print(json.dumps(result));await b.close()
++asyncio.run(main())
+--- /dev/null
++++ b/RemotePlay.Web/tests/browser_sw_test.py
+@@ -0,0 +1,23 @@
++import asyncio,json,re
++from pathlib import Path
++from playwright.async_api import async_playwright
++async def main():
++ async with async_playwright() as p:
++  browser=await p.chromium.launch(executable_path=__import__('os').environ.get('CHROMIUM_PATH'),headless=True,args=['--no-sandbox'])
++  page=await browser.new_page()
++  await page.goto('http://127.0.0.1:5189/app/psrp-web/')
++  await page.evaluate('navigator.serviceWorker.ready')
++  await page.reload()
++  await page.wait_for_function('navigator.serviceWorker.controller!==null')
++  cache=await page.evaluate('''async()=>{const urls=[];for(const name of await caches.keys()){const c=await caches.open(name);for(const r of await c.keys())urls.push(r.url)}return urls}''')
++  assert any('/assets/index-' in u and '.js' in u for u in cache),cache
++  assert not any('/diagnostics/' in u or '/api/' in u for u in cache),cache
++  observations=[]
++  for path in ['diagnostics/api/video.html','diagnostics/api/video.html','api/cache-probe']:
++   response=await page.goto('http://127.0.0.1:5189/app/psrp-web/'+path)
++   data=await response.json();assert data['network'],data
++   observations.append(data)
++  assert observations[1]['count']>observations[0]['count'],observations
++  print(json.dumps({'serviceWorkerControlled':True,'cachedAssetCount':len(cache),'diagnosticAndApiNavigations':observations,'noSpaFallback':True},indent=2))
++  await browser.close()
++asyncio.run(main())
+--- /dev/null
++++ b/RemotePlay.Web/tests/lifecycle-hook-harness.tsx
+@@ -0,0 +1,27 @@
++import React, { useRef } from 'react'
++import { createRoot } from 'react-dom/client'
++import '../src/i18n/config'
++import { GamepadProvider } from '../src/hooks/use-gamepad'
++import { useStreamingConnection } from '../src/hooks/use-streaming-connection'
++import { streamingHubService } from '../src/service/streaming-hub.service'
++import { controllerService } from '../src/service/controller.service'
++
++// Test transport only; the real hook, API client, lease code and native confirm remain unchanged.
++streamingHubService.ensureConnected = async () => undefined as any
++streamingHubService.disconnect = async () => undefined
++controllerService.disconnect = async () => undefined
++controllerService.connect = async () => undefined
++controllerService.isConnected = () => true
++function Harness() {
++  const videoRef = useRef<HTMLVideoElement>(null)
++  const connection = useStreamingConnection({ hostId: 'ps5', deviceName: 'fixture', isLikelyLan: true, videoRef, toast: () => {}, onConnectionError: () => {} })
++  return <main>
++    <video ref={videoRef}/>
++    <output id="status">{JSON.stringify({connected: connection.isConnected, connecting: connection.isConnecting})}</output>
++    <button id="connect" onClick={() => void connection.connect()}>连接</button>
++    <button id="rebuild" onClick={() => void connection.connect({ reuseRemotePlaySessionId: new URLSearchParams(location.search).get('remote') || 'remote' })}>重建</button>
++    <button id="disconnect" onClick={connection.disconnect}>仅断开浏览器</button>
++    <button id="end" onClick={() => void connection.endRemoteSession()}>结束 PS5 会话</button>
++  </main>
++}
++createRoot(document.getElementById('root')!).render(<GamepadProvider><Harness/></GamepadProvider>)
+--- a/RemotePlay.Web/vite.config.ts
++++ b/RemotePlay.Web/vite.config.ts
+@@ -33,8 +33,11 @@
+       workbox: {
+         globPatterns: ['**/*.{js,css,html,ico,png,svg,jpg,woff2}'],
+         cleanupOutdatedCaches: true,
++        skipWaiting: true,
++        clientsClaim: true,
++        globIgnores: ['**/diagnostics/**', '**/video.html'],
+         // 后端接口与 SignalR 必须直连网络，不能被 SPA 回退到 index.html
+-        navigateFallbackDenylist: [/\/api(?:\/|$)/, /\/hubs(?:\/|$)/, /\/swagger(?:\/|$)/],
++        navigateFallbackDenylist: [/\/api(?:\/|$)/, /\/hubs(?:\/|$)/, /\/swagger(?:\/|$)/, /\/diagnostics(?:\/|$)/, /\/video\.html$/],
+       },
+     }),
+   ],
+--- a/RemotePlay/Controllers/PlayStationController.cs
++++ b/RemotePlay/Controllers/PlayStationController.cs
+@@ -19,6 +19,7 @@
+ namespace RemotePlay.Controllers
+ {
+     [Route("api/[controller]")]
++    [Authorize]
+     [ApiController]
+     public class PlayStationController : ControllerBase
+     {
+@@ -292,7 +293,7 @@
+         /// <returns>session</returns>
+         [HttpPost("start-session")]
+         [Authorize]
+-        public async Task<ActionResult> StartSession(string hostId)
++        public async Task<ActionResult> StartSession(string hostId, long? confirmedGeneration = null, bool probeOnly = false)
+         {
+             var userId = GetCurrentUserId();
+             if (string.IsNullOrEmpty(userId))
+@@ -331,6 +332,8 @@
+                     ErrorCode = ErrorCode.InvalidRequest
+                 });
+ 
++            var lifecycle = HttpContext.RequestServices.GetRequiredService<RemotePlay.Services.Lifecycle.SessionLifecycle>();
++            // StartSession is serialized by LifecycleFilter before any console I/O.
+             // 先检查是否已存在活跃的 session
+             var existingSessions = await _sessionService.ListSessionsAsync();
+             var existingSession = existingSessions
+@@ -339,11 +342,13 @@
+             RemoteSession _session;
+             if (existingSession != null)
+             {
+-                // 返回已存在的活跃 session
++                if (lifecycle.Find(existingSession.Id)?.Owner != userId)
++                    return StatusCode(403, new { success = false, errorMessage = "设备忙或无权访问" });
+                 _session = existingSession;
+             }
+             else
+             {
++                if (probeOnly) return Ok(new { success = true, data = new { needsConsoleStart = true } });
+                 // 创建新的 session
+                 var deviceSettings = await _deviceSettingsService.GetEffectiveSettingsAsync(userId, _device.Id, HttpContext.RequestAborted);
+ 
+@@ -374,10 +379,17 @@
+                     sessionOptions);
+             }
+ 
++            if (existingSession == null) lifecycle.Register(_session, userId);
++            var lease = lifecycle.Prepare(_session.Id, userId, confirmedGeneration);
++            if (lease.Status != 200)
++                return StatusCode(lease.Status, new { success = false, generation = lease.Generation,
++                    errorMessage = "此 PS5 已有会话。确认接管当前浏览器？取消不会影响原连接。将复用现有 PS5 编码参数，设置变更需明确结束后重开。",
++                    actualSettings = new { _session.Resolution, _session.Fps, _session.Bitrate, _session.StreamType, _session.Quality, _session.LaunchOptions } });
+             return Ok(new ApiSuccessResponse<object>
+             {
+                 Success = true,
+-                Data = _session,
++                Data = new { _session.Id, _session.HostId, lease.Generation, lease.Token, _session.Resolution, _session.Fps, _session.Bitrate, _session.StreamType, _session.Quality, _session.LaunchOptions,
++                    reused = existingSession != null, settingsNotice = existingSession != null ? $"正在复用原有 PS5 编码参数：{_session.LaunchOptions.VideoCodec} / {_session.LaunchOptions.Width}×{_session.LaunchOptions.Height} / {_session.LaunchOptions.Fps}fps / {_session.LaunchOptions.BitrateKbps}kbps。修改设置需明确结束 PS5 会话后重新开始。" : null },
+                 Message = "会话启动成功"
+             });
+         }
+@@ -390,7 +402,14 @@
+         [HttpPost("stop-session")]
+         public async Task<ActionResult> StopSession(Guid sessionId)
+         {
++            var lifecycle = HttpContext.RequestServices.GetRequiredService<RemotePlay.Services.Lifecycle.SessionLifecycle>();
++            var entry = lifecycle.Find(sessionId);
++            if (entry != null) { lock (entry.Sync) entry.Closing = true; }
++            await _streamingService.StopStreamAsync(sessionId);
+             var _session = await _sessionService.StopSessionAsync(sessionId);
++            var rtc = HttpContext.RequestServices.GetRequiredService<RemotePlay.Services.WebRTC.WebRTCSignalingService>();
++            foreach (var browser in rtc.GetAllSessions().Where(b => b.StreamingSessionId == sessionId).ToArray()) await rtc.RemoveSessionAsync(browser.SessionId);
++            lifecycle.Forget(sessionId);
+             return Ok(new ApiSuccessResponse<bool>
+             {
+                 Success = true,
+@@ -589,8 +608,8 @@
+             return Ok(new ApiSuccessResponse<object>
+             {
+                 Success = true,
+-                Data = _session,
+-                Message = "获取会话成功"
++                Data = _session == null ? null : new { _session.Id, _session.HostId, _session.IsActive, _session.Resolution, _session.Fps, _session.StreamType },
++                Message = "会话信息获取成功"
+             });
+         }
+         /// <summary>
+@@ -807,11 +826,11 @@
+                 _ => IControllerService.ButtonAction.TAP
+             };
+ 
+-            await _controllerService.ButtonAsync(
+-                request.SessionId,
+-                buttonType,
+-                action,
+-                request.DelayMs ?? 100);
++            if (action == IControllerService.ButtonAction.TAP && (request.DelayMs is < 0 or > 1000))
++                return BadRequest(new { success = false, errorMessage = "Tap duration must be between 0 and 1000 ms" });
++            await RemotePlay.Services.Lifecycle.LifecycleButton.SendAsync(HttpContext.RequestServices, User,
++                Request.Headers["X-PSRP-Lease"].ToString(), request.SessionId, buttonType, action,
++                request.DelayMs ?? 100, HttpContext.RequestAborted);
+ 
+             return Ok(new ApiSuccessResponse<bool>
+             {
+--- a/RemotePlay/Controllers/StreamingController.cs
++++ b/RemotePlay/Controllers/StreamingController.cs
+@@ -18,6 +18,7 @@
+ 
+ namespace RemotePlay.Controllers
+ {
++    [Authorize]
+     [ApiController]
+     [Route("api/[controller]")]
+     public class StreamingController : ControllerBase
+--- a/RemotePlay/Controllers/WebRTCController.cs
++++ b/RemotePlay/Controllers/WebRTCController.cs
+@@ -11,6 +11,7 @@
+ 
+ namespace RemotePlay.Controllers
+ {
++    [Microsoft.AspNetCore.Authorization.Authorize]
+     [ApiController]
+     [Route("api/[controller]")]
+     public class WebRTCController : ControllerBase
+@@ -57,6 +58,17 @@
+                 }
+ 
+                 var (sessionId, offer) = await _signalingService.CreateSessionAsync(preferredCodec, preferLanCandidates);
++                var lifecycle = HttpContext.RequestServices.GetRequiredService<RemotePlay.Services.Lifecycle.SessionLifecycle>();
++                var owner = RemotePlay.Services.Lifecycle.LifecycleAccess.Owner(User);
++                var token = Request.Headers["X-PSRP-Lease"].ToString();
++                var remoteId = request!.RemotePlaySessionId!.Value;
++                if (!lifecycle.Bind(remoteId, owner, token, sessionId))
++                {
++                    await _signalingService.RemoveSessionAsync(sessionId);
++                    return StatusCode(409, new ApiErrorResponse { Success = false, ErrorMessage = "浏览器租约已过期，请重新确认接管" });
++                }
++                var rtc = _signalingService.GetSession(sessionId)!;
++                rtc.OwnerId = owner; rtc.LifecycleToken = token; rtc.StreamingSessionId = remoteId;
+                 
+                 _logger.LogInformation("🎯 WebRTC offer created: {SessionId}", sessionId);
+                 
+@@ -437,7 +449,9 @@
+                 }
+                 
+                 // 连接接收器到流
+-                stream.AddReceiver(receiver);
++                // Prepare only. Do not switch the single receiver away from the old peer until commit.
++                var candidateSession = _signalingService.GetSession(webrtcSessionId)!;
++                candidateSession.IsBound = true;
+                 
+                 // ✅ 设置 StreamingSessionId，以便关键帧请求功能可以正常工作
+                 var webrtcSession = _signalingService.GetSession(webrtcSessionId);
+@@ -485,6 +499,32 @@
+         /// <summary>
+         /// 获取会话状态
+         /// </summary>
++        [HttpPost("session/{sessionId}/commit")]
++        public async Task<ActionResult<ResponseModel>> CommitBrowser(string sessionId)
++        {
++            var rtc = _signalingService.GetSession(sessionId)!;
++            var lifecycle = HttpContext.RequestServices.GetRequiredService<RemotePlay.Services.Lifecycle.SessionLifecycle>();
++            var remoteId = rtc.StreamingSessionId!.Value;
++            if (!rtc.IsBound || rtc.PeerConnection.connectionState != RTCPeerConnectionState.connected)
++                return StatusCode(409, new ApiErrorResponse { Success = false, ErrorMessage = "新 WebRTC 尚未就绪，原连接保持不变" });
++            var stream = await _streamingService.GetStreamAsync(remoteId);
++            if (stream == null) return StatusCode(409, new ApiErrorResponse { Success = false, ErrorMessage = "远程播放流不可用" });
++            lifecycle.SetConnected(remoteId, rtc.LifecycleToken, true);
++            if (!lifecycle.Commit(remoteId, rtc.OwnerId, rtc.LifecycleToken))
++                return StatusCode(409, new ApiErrorResponse { Success = false, ErrorMessage = "接管代次过期，请重新确认" });
++            stream.AddReceiver(rtc.Receiver);
++            if (_controllerService != null)
++            {
++                // Reset held buttons/sticks at the atomic control handoff.
++                await _controllerService.DisconnectAsync(remoteId);
++                await _controllerService.ConnectAsync(remoteId);
++                await _controllerService.StartAsync(remoteId);
++            }
++            foreach (var old in _signalingService.GetAllSessions().Where(s => s.StreamingSessionId == remoteId && s.SessionId != sessionId).ToArray())
++                await _signalingService.RemoveSessionAsync(old.SessionId);
++            return Ok(new ApiSuccessResponse<bool> { Success = true, Data = true, Message = "接管成功" });
++        }
++
+         [HttpGet("session/{sessionId}")]
+         public ActionResult<ResponseModel> GetSessionStatus(string sessionId)
+         {
+--- a/RemotePlay/Hubs/ControllerHub.cs
++++ b/RemotePlay/Hubs/ControllerHub.cs
+@@ -9,6 +9,7 @@
+     /// SignalR Hub for low-latency controller input
+     /// 用于低延迟控制器输入的SignalR Hub
+     /// </summary>
++    [Microsoft.AspNetCore.Authorization.Authorize]
+     public class ControllerHub : Hub
+     {
+         private readonly IControllerService _controllerService;
+@@ -142,11 +143,10 @@
+                     _ => IControllerService.ButtonAction.TAP
+                 };
+ 
+-                await _controllerService.ButtonAsync(
+-                    sessionId,
+-                    buttonType,
+-                    buttonAction,
+-                    delayMs ?? 100);
++                var http = Context.GetHttpContext()!;
++                await RemotePlay.Services.Lifecycle.LifecycleButton.SendAsync(http.RequestServices, Context.User!,
++                    http.Request.Query["lease"].ToString(), sessionId, buttonType, buttonAction,
++                    delayMs ?? 100, Context.ConnectionAborted);
+ 
+                 // 不等待响应，直接返回成功（降低延迟）
+                 await Clients.Caller.SendAsync("ButtonSent", true);
+--- a/RemotePlay/Hubs/StreamingHub.cs
++++ b/RemotePlay/Hubs/StreamingHub.cs
+@@ -10,6 +10,7 @@
+     /// <summary>
+     /// WebRTC/流媒体相关的 SignalR Hub
+     /// </summary>
++    [Microsoft.AspNetCore.Authorization.Authorize]
+     public class StreamingHub : Hub
+     {
+         private const string UserGroupPrefix = "user:";
+--- a/RemotePlay/Program.cs
++++ b/RemotePlay/Program.cs
+@@ -10,6 +10,12 @@
+ using System.Text;
+ 
+ var builder = WebApplication.CreateBuilder(args);
++builder.Services.AddSingleton<RemotePlay.Services.Lifecycle.SessionLifecycle>(sp => new() { Grace = TimeSpan.FromSeconds(Math.Clamp(builder.Configuration.GetValue<int?>("RemotePlay:BrowserGraceSeconds") ?? 60, 1, 3600)) });
++builder.Services.AddScoped<RemotePlay.Services.Lifecycle.LifecycleAccess>();
++builder.Services.AddScoped<RemotePlay.Services.Lifecycle.LifecycleFilter>();
++builder.Services.Configure<Microsoft.AspNetCore.Mvc.MvcOptions>(o => o.Filters.AddService<RemotePlay.Services.Lifecycle.LifecycleFilter>());
++builder.Services.AddSingleton<RemotePlay.Services.Lifecycle.LifecycleHubFilter>();
++builder.Services.AddHostedService<RemotePlay.Services.Lifecycle.LifecycleReaper>();
+ 
+ // Add services to the container.
+ 
+@@ -130,6 +136,7 @@
+ // 添加SignalR服务（用于低延迟控制器输入）
+ builder.Services.AddSignalR(options =>
+ {
++    Microsoft.AspNetCore.SignalR.HubOptionsExtensions.AddFilter<RemotePlay.Services.Lifecycle.LifecycleHubFilter>(options);
+     // 配置SignalR选项以优化延迟
+     options.EnableDetailedErrors = builder.Environment.IsDevelopment();
+     options.MaximumReceiveMessageSize = 1024 * 1024; // 1MB
+--- a/RemotePlay/Services/Controller/ControllerService.cs
++++ b/RemotePlay/Services/Controller/ControllerService.cs
+@@ -104,6 +104,8 @@
+             int delayMs = 100,
+             CancellationToken ct = default)
+         {
++            if (action == IControllerService.ButtonAction.TAP && (delayMs < 0 || delayMs > 1000))
++                throw new ArgumentOutOfRangeException(nameof(delayMs), "Tap duration must be between 0 and 1000 ms");
+             if (!_controllers.TryGetValue(sessionId, out var controller))
+             {
+                 _logger.LogWarning("No controller connected for session {SessionId}", sessionId);
+--- /dev/null
++++ b/RemotePlay/Services/Lifecycle/LifecycleAccess.cs
+@@ -0,0 +1,18 @@
++using System.Security.Claims;
++using Microsoft.EntityFrameworkCore;
++using RemotePlay.Models.Context;
++
++namespace RemotePlay.Services.Lifecycle;
++
++public sealed class LifecycleAccess(RPContext db, SessionLifecycle lifecycle)
++{
++    public static string Owner(ClaimsPrincipal user) => user.FindFirstValue(ClaimTypes.NameIdentifier) ?? "";
++    public async Task<bool> DeviceAllowed(string owner, string host, CancellationToken ct = default) =>
++        !string.IsNullOrEmpty(owner) && await db.UserDevices.AsNoTracking()
++            .AnyAsync(x => x.UserId == owner && x.IsActive && x.Device != null && x.Device.HostId == host, ct);
++    public async Task<bool> Allowed(ClaimsPrincipal user, Guid remote, string token, bool currentOnly = false)
++    {
++        var e = lifecycle.Find(remote);
++        return e != null && lifecycle.Allows(remote, Owner(user), token, currentOnly) && await DeviceAllowed(Owner(user), e.Session.HostId);
++    }
++}
+--- /dev/null
++++ b/RemotePlay/Services/Lifecycle/LifecycleButton.cs
+@@ -0,0 +1,38 @@
++using System.Security.Claims;
++using RemotePlay.Contracts.Services;
++using RemotePlay.Services.Streaming.Controller;
++
++namespace RemotePlay.Services.Lifecycle;
++
++/// <summary>Tap waits never hold HostGate; each state mutation revalidates the current lease.</summary>
++public static class LifecycleButton
++{
++    public static async Task SendAsync(IServiceProvider services, ClaimsPrincipal user, string token,
++        Guid id, FeedbackEvent.ButtonType button, IControllerService.ButtonAction action, int delayMs, CancellationToken ct)
++    {
++        if (action == IControllerService.ButtonAction.TAP && (delayMs < 0 || delayMs > 1000))
++            throw new ArgumentOutOfRangeException(nameof(delayMs), "Tap duration must be between 0 and 1000 ms");
++        var life = services.GetRequiredService<SessionLifecycle>();
++        if (life.Find(id) is not { } entry) throw new UnauthorizedAccessException("会话不可用或无权访问");
++        var gate = life.HostGate(entry.Session.HostId);
++        async Task Send(IControllerService.ButtonAction state, CancellationToken cancellation, bool required)
++        {
++            await gate.WaitAsync(cancellation);
++            try
++            {
++                using var scope = services.CreateScope();
++                if (!await scope.ServiceProvider.GetRequiredService<LifecycleAccess>().Allowed(user, id, token, true))
++                {
++                    if (required) throw new UnauthorizedAccessException("会话不可用或无权访问");
++                    return; // Never release a button on a replacement controller's lease.
++                }
++                await services.GetRequiredService<IControllerService>().ButtonAsync(id, button, state, 0, cancellation);
++            }
++            finally { gate.Release(); }
++        }
++        if (action != IControllerService.ButtonAction.TAP) { await Send(action, ct, true); return; }
++        await Send(IControllerService.ButtonAction.PRESS, ct, true);
++        try { await Task.Delay(delayMs, ct); }
++        finally { await Send(IControllerService.ButtonAction.RELEASE, CancellationToken.None, false); }
++    }
++}
+--- /dev/null
++++ b/RemotePlay/Services/Lifecycle/LifecycleFilter.cs
+@@ -0,0 +1,68 @@
++using Microsoft.AspNetCore.Mvc;
++using Microsoft.AspNetCore.Mvc.Filters;
++using RemotePlay.Controllers;
++using RemotePlay.Services.WebRTC;
++
++namespace RemotePlay.Services.Lifecycle;
++
++/// <summary>Fail-closed gate for every session-bearing HTTP action, including diagnostics and input.</summary>
++public sealed class LifecycleFilter(SessionLifecycle lifecycle, LifecycleAccess access, WebRTCSignalingService signaling) : IAsyncActionFilter
++{
++    static ObjectResult Denied(int status = 403) => new(new { success = false, errorMessage = "会话不可用或无权访问" }) { StatusCode = status };
++    public async Task OnActionExecutionAsync(ActionExecutingContext ctx, ActionExecutionDelegate next)
++    {
++        var controller = ctx.Controller;
++        if (controller is not PlayStationController && controller is not WebRTCController && controller is not StreamingController) { await next(); return; }
++        var args = ctx.ActionArguments;
++        var owner = LifecycleAccess.Owner(ctx.HttpContext.User);
++        string token = ctx.HttpContext.Request.Headers["X-PSRP-Lease"].ToString();
++        if (args.TryGetValue("hostId", out var hostArg) && ctx.ActionDescriptor.RouteValues["action"] is "StartSession" or "WakeUpConsole")
++        {
++            if (string.IsNullOrEmpty(owner)) { ctx.Result = Denied(401); return; }
++            var host = hostArg?.ToString() ?? "";
++            if (!await access.DeviceAllowed(owner, host)) { ctx.Result = Denied(); return; }
++            var gate = lifecycle.HostGate(host); await gate.WaitAsync(ctx.HttpContext.RequestAborted);
++            try { await next(); } finally { gate.Release(); }
++            return;
++        }
++        string? session = (args.TryGetValue("sessionId", out var sessionIdArg) ? sessionIdArg?.ToString() : null);
++        string? remote = (args.TryGetValue("remotePlaySessionId", out var remotePlaySessionIdArg) ? remotePlaySessionIdArg?.ToString() : null);
++        var browser = (args.TryGetValue("webrtcSessionId", out var webrtcSessionIdArg) ? webrtcSessionIdArg?.ToString() : null);
++        foreach (var arg in args.Values.Where(x => x != null))
++        {
++            remote ??= arg!.GetType().GetProperty("RemotePlaySessionId")?.GetValue(arg)?.ToString();
++            session ??= arg!.GetType().GetProperty("SessionId")?.GetValue(arg)?.ToString();
++        }
++        if (controller is WebRTCController)
++        {
++            browser ??= session;
++            if (browser != null)
++            {
++                var rtc = signaling.GetSession(browser);
++                if (rtc == null || rtc.OwnerId != owner || rtc.LifecycleToken != token || rtc.StreamingSessionId == null ||
++                    (remote != null && remote != rtc.StreamingSessionId.ToString())) { ctx.Result = Denied(); return; }
++                remote = rtc.StreamingSessionId.ToString();
++            }
++            if (remote == null) { ctx.Result = Denied(); return; } // no global session enumeration or unbound offers
++        }
++        else remote ??= session;
++        if (remote == null) { await next(); return; } // non-lifecycle settings/device APIs retain their existing auth
++        if (string.IsNullOrEmpty(owner)) { ctx.Result = Denied(401); return; }
++        if (!Guid.TryParse(remote, out var id) || lifecycle.Find(id) is not { } entry) { ctx.Result = Denied(); return; }
++        var hostGate = lifecycle.HostGate(entry.Session.HostId); await hostGate.WaitAsync(ctx.HttpContext.RequestAborted);
++        bool gateHeld = true;
++        try
++        {
++            var action = ctx.ActionDescriptor.RouteValues["action"] ?? "";
++            bool currentOnly = controller is not WebRTCController && action != "StartStream" && action != "GetStreamHealth" && action != "GetSession";
++            if (!await access.Allowed(ctx.HttpContext.User, id, token, currentOnly) ||
++                (browser != null && !lifecycle.OwnsBrowser(id, owner, token, browser))) { ctx.Result = Denied(); return; }
++            // Legacy endpoints cannot implicitly stop a shared console/controller or change its stream.
++            if (action is "StopStream" or "DisconnectController" or "StopController" or "AttachReceiver" or "AttachFileReceiver" or "AttachFfplayReceiver" or "AttachFfmpegReceiver" or "ShareHls")
++            { ctx.Result = Denied(); return; }
++            if (action == "ControllerButton") { hostGate.Release(); gateHeld = false; }
++            await next();
++        }
++        finally { if (gateHeld) hostGate.Release(); }
++    }
++}
+--- /dev/null
++++ b/RemotePlay/Services/Lifecycle/LifecycleHubFilter.cs
+@@ -0,0 +1,38 @@
++using Microsoft.AspNetCore.SignalR;
++using RemotePlay.Hubs;
++
++namespace RemotePlay.Services.Lifecycle;
++
++public sealed class LifecycleHubFilter(SessionLifecycle lifecycle, IServiceScopeFactory scopes, global::RemotePlay.Services.WebRTC.WebRTCSignalingService signaling) : IHubFilter
++{
++    public async ValueTask<object?> InvokeMethodAsync(HubInvocationContext ctx, Func<HubInvocationContext, ValueTask<object?>> next)
++    {
++        if (ctx.Hub is not ControllerHub && ctx.Hub is not StreamingHub) return await next(ctx);
++        Guid id;
++        string? browser = null;
++        if (ctx.Hub is StreamingHub)
++        {
++            browser = ctx.HubMethodArguments.FirstOrDefault()?.ToString();
++            var rtc = browser == null ? null : signaling.GetSession(browser);
++            if (rtc?.StreamingSessionId == null) throw new HubException("会话不可用或无权访问");
++            id = rtc.StreamingSessionId.Value;
++        }
++        else if (ctx.HubMethodArguments.FirstOrDefault() is Guid remoteId) id = remoteId;
++        else throw new HubException("会话不可用或无权访问");
++        if (lifecycle.Find(id) is not { } e) throw new HubException("会话不可用或无权访问");
++        var token = ctx.Context.GetHttpContext()?.Request.Query["lease"].ToString() ?? "";
++        var gate = lifecycle.HostGate(e.Session.HostId); await gate.WaitAsync(ctx.Context.ConnectionAborted);
++        bool gateHeld = true;
++        try
++        {
++            using var scope = scopes.CreateScope();
++            if (!await scope.ServiceProvider.GetRequiredService<LifecycleAccess>().Allowed(ctx.Context.User!, id, token, ctx.Hub is ControllerHub) ||
++                (browser != null && !lifecycle.OwnsBrowser(id, LifecycleAccess.Owner(ctx.Context.User!), token, browser)))
++                throw new HubException("会话不可用或无权访问");
++            if (ctx.HubMethodName is "DisconnectController" or "StopController") return null;
++            if (ctx.Hub is ControllerHub && ctx.HubMethodName == "Button") { gate.Release(); gateHeld = false; }
++            return await next(ctx);
++        }
++        finally { if (gateHeld) gate.Release(); }
++    }
++}
+--- /dev/null
++++ b/RemotePlay/Services/Lifecycle/LifecycleReaper.cs
+@@ -0,0 +1,46 @@
++using RemotePlay.Contracts.Services;
++using RemotePlay.Services.WebRTC;
++
++namespace RemotePlay.Services.Lifecycle;
++
++public sealed class LifecycleReaper(SessionLifecycle lifecycle, ISessionService sessions, IStreamingService streams, WebRTCSignalingService rtc, ILogger<LifecycleReaper> log, IServiceScopeFactory scopes) : BackgroundService
++{
++    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
++    {
++        using var timer = new PeriodicTimer(TimeSpan.FromSeconds(1));
++        // Each host retains its gate while cleaning up; a slow host cannot stall later ticks.
++        while (await timer.WaitForNextTickAsync(stoppingToken)) _ = SweepAsync(stoppingToken);
++    }
++    public Task SweepAsync(CancellationToken stoppingToken = default) =>
++        Task.WhenAll(lifecycle.Entries.Select(e => ReapAsync(e, stoppingToken)));
++    async Task ReapAsync(SessionLifecycle.Entry e, CancellationToken stoppingToken)
++    {
++            var gate = lifecycle.HostGate(e.Session.HostId);
++            if (!await gate.WaitAsync(0, stoppingToken)) return;
++            try
++            {
++                using var scope = scopes.CreateScope();
++                if ((e.Current != null || e.Pending != null) &&
++                    !await scope.ServiceProvider.GetRequiredService<LifecycleAccess>().DeviceAllowed(e.Owner, e.Session.HostId, stoppingToken))
++                {
++                    string? current, pending;
++                    lock (e.Sync) { current = e.Current; pending = e.Pending; }
++                    if (current != null) lifecycle.Release(e.Session.Id, current);
++                    if (pending != null) lifecycle.Release(e.Session.Id, pending);
++                }
++                foreach (var browser in rtc.GetAllSessions().Where(b => b.StreamingSessionId == e.Session.Id).ToArray())
++                    if (!lifecycle.Allows(e.Session.Id, browser.OwnerId, browser.LifecycleToken)) await rtc.RemoveSessionAsync(browser.SessionId);
++                if (e.Closing || lifecycle.Expired(e.Session.Id) || !e.Session.IsActive)
++                {
++                    lock (e.Sync) e.Closing = true;
++                    // A failed media shutdown must never leave console TCP unbounded.
++                    try { await streams.StopStreamAsync(e.Session.Id); }
++                    finally { await sessions.StopSessionAsync(e.Session.Id); }
++                    foreach (var browser in rtc.GetAllSessions().Where(b => b.StreamingSessionId == e.Session.Id).ToArray()) await rtc.RemoveSessionAsync(browser.SessionId);
++                    lifecycle.Forget(e.Session.Id);
++                }
++            }
++            catch (Exception ex) { log.LogError(ex, "Lifecycle cleanup failed; retrying next sweep"); }
++            finally { gate.Release(); }
++    }
++}
+--- /dev/null
++++ b/RemotePlay/Services/Lifecycle/SessionLifecycle.cs
+@@ -0,0 +1,108 @@
++using System.Collections.Concurrent;
++using RemotePlay.Models.PlayStation;
++
++namespace RemotePlay.Services.Lifecycle;
++
++/// <summary>All state transitions run under Sync; async callers also hold HostGate across I/O.</summary>
++public sealed class SessionLifecycle(TimeProvider? clock = null)
++{
++    readonly TimeProvider time = clock ?? TimeProvider.System;
++    readonly ConcurrentDictionary<Guid, Entry> entries = new();
++    readonly ConcurrentDictionary<string, SemaphoreSlim> gates = new();
++    public TimeSpan Grace { get; set; } = TimeSpan.FromSeconds(60);
++    public SemaphoreSlim HostGate(string host) => gates.GetOrAdd(host, _ => new(1, 1));
++    public sealed record LeaseResult(int Status, long Generation, string? Token = null);
++    public sealed class Entry(RemoteSession session, string owner, DateTimeOffset now)
++    {
++        public readonly object Sync = new();
++        public RemoteSession Session { get; } = session;
++        public string Owner { get; } = owner;
++        public long Generation;
++        public string? Pending, Current;
++        public DateTimeOffset PendingUntil, IdleSince = now;
++        public readonly HashSet<string> Connected = new();
++        public readonly Dictionary<string, string> Browsers = new();
++        public bool Closing;
++    }
++    public Entry? Find(Guid id) => entries.GetValueOrDefault(id);
++    public Entry? FindHost(string host) => entries.Values.FirstOrDefault(e => e.Session.HostId == host && !e.Closing && e.Session.IsActive);
++    public void Register(RemoteSession s, string owner)
++    {
++        if (string.IsNullOrEmpty(owner)) throw new ArgumentException("Owner required");
++        if (!entries.TryAdd(s.Id, new(s, owner, time.GetUtcNow()))) throw new InvalidOperationException("Already registered");
++    }
++    public LeaseResult Prepare(Guid id, string owner, long? confirmedGeneration)
++    {
++        var e = Find(id);
++        if (e == null) return new(403, 0);
++        lock (e.Sync)
++        {
++            if (e.Closing || !e.Session.IsActive || string.IsNullOrEmpty(owner) || e.Owner != owner) return new(403, 0);
++            if (e.Generation != 0 && confirmedGeneration != e.Generation) return new(409, e.Generation);
++            e.Pending = Guid.NewGuid().ToString("N");
++            e.PendingUntil = time.GetUtcNow() + Grace;
++            return new(200, ++e.Generation, e.Pending);
++        }
++    }
++    public bool Allows(Guid id, string owner, string token, bool currentOnly = false)
++    {
++        var e = Find(id); if (e == null || string.IsNullOrEmpty(token)) return false;
++        lock (e.Sync) return !e.Closing && e.Session.IsActive && owner == e.Owner &&
++            (e.Current == token || (!currentOnly && e.Pending == token && time.GetUtcNow() < e.PendingUntil));
++    }
++    public bool IsCurrent(Guid id, string owner, string token) => Allows(id, owner, token, true);
++    public bool Bind(Guid id, string owner, string token, string browser)
++    {
++        var e = Find(id); if (e == null) return false;
++        lock (e.Sync)
++        {
++            if (!Allows(id, owner, token)) return false;
++            // One peer per lease: duplicate offers must use a new prepare/confirmation.
++            if (e.Browsers.TryGetValue(token, out var old) && old != browser) return false;
++            e.Browsers[token] = browser; return true;
++        }
++    }
++    public bool OwnsBrowser(Guid id, string owner, string token, string browser)
++    {
++        var e = Find(id); if (e == null) return false;
++        lock (e.Sync) return Allows(id, owner, token) && e.Browsers.GetValueOrDefault(token) == browser;
++    }
++    public void SetConnected(Guid id, string token, bool connected)
++    {
++        var e = Find(id); if (e == null) return;
++        lock (e.Sync)
++        {
++            if (connected && (e.Current == token || e.Pending == token)) e.Connected.Add(token);
++            else if (e.Connected.Remove(token) && e.Current == token) e.IdleSince = time.GetUtcNow();
++        }
++    }
++    public bool Commit(Guid id, string owner, string token)
++    {
++        var e = Find(id); if (e == null) return false;
++        lock (e.Sync)
++        {
++            if (!Allows(id, owner, token) || !e.Connected.Contains(token)) return false;
++            if (e.Current == token) return true;
++            if (e.Pending != token) return false;
++            e.Current = token; e.Pending = null;
++            return true;
++        }
++    }
++    public void Release(Guid id, string token)
++    {
++        var e = Find(id); if (e == null) return;
++        lock (e.Sync)
++        {
++            e.Connected.Remove(token); e.Browsers.Remove(token);
++            if (e.Current == token) { e.Current = null; e.IdleSince = time.GetUtcNow(); }
++            if (e.Pending == token) e.Pending = null;
++        }
++    }
++    public bool Expired(Guid id)
++    {
++        var e = Find(id); if (e == null) return false;
++        lock (e.Sync) return !e.Closing && (e.Current == null || !e.Connected.Contains(e.Current)) && time.GetUtcNow() - e.IdleSince >= Grace;
++    }
++    public Entry[] Entries => entries.Values.ToArray();
++    public void Forget(Guid id) => entries.TryRemove(id, out _);
++}
+--- a/RemotePlay/Services/Session/SessionService.cs
++++ b/RemotePlay/Services/Session/SessionService.cs
+@@ -722,6 +722,13 @@
+                 }
+                 _logger.LogDebug(ex, "Session receive loop error");
+             }
++            finally
++            {
++                // EOF/protocol failure is a genuine console failure, not a browser disconnect.
++                await StopSessionAsync(sessionId);
++                var streaming = _serviceProvider.GetService<IStreamingService>();
++                if (streaming != null) await streaming.StopStreamAsync(sessionId);
++            }
+         }
+ 
+         private static async Task<int> ReadExactAsync(NetworkStream stream, byte[] buffer, int offset, int count, CancellationToken ct)
+--- a/RemotePlay/Services/Streaming/Core/RPStreamV2.cs
++++ b/RemotePlay/Services/Streaming/Core/RPStreamV2.cs
+@@ -508,109 +508,129 @@
+         /// 添加/切换接收器
+         /// ✅ 支持实时切换：如果已有 receiver，会切换到新的，并自动同步当前状态
+         /// </summary>
++        // Disconnect callbacks do not hold HostGate. Serialize the instance check,
++        // reference change and both media routes with AddReceiver on the stream itself.
++        private readonly object _receiverSync = new();
++
++        public void RemoveReceiver(IAVReceiver expected)
++        {
++            lock (_receiverSync)
++            {
++                if (!ReferenceEquals(_receiver, expected)) return;
++                // Keep the console transport alive but route no more media to the removed peer.
++                var sink = new Receiver.DefaultReceiver(Microsoft.Extensions.Logging.Abstractions.NullLogger<Receiver.DefaultReceiver>.Instance);
++                _receiver = null;
++                _avPipeline?.SetReceiver(sink);
++                _avHandler?.SetReceiver(sink);
++            }
++        }
++
+         public void AddReceiver(IAVReceiver receiver)
+         {
+             if (receiver == null)
+                 throw new ArgumentNullException(nameof(receiver));
+ 
+-            var oldReceiver = _receiver;
+-            _receiver = receiver;
+-            
+-            // ✅ 支持新旧两种架构
+-            if (_usePipeline)
+-            {
+-                // 初始化 Pipeline（如果还没有初始化）
+-                if (_avPipeline == null)
+-                {
+-                    _logger.LogInformation("🚀 Initializing AV Pipeline");
+-                    _avPipeline = new AVPipelineCoordinator(
+-                        _loggerFactory.CreateLogger<AVPipelineCoordinator>(),
+-                        _loggerFactory,
+-                        _session.HostType,
+-                        receiver,
+-                        _cancellationToken
+-                    );
+-                    
+-                    // 如果已有 cipher，设置它
+-                    if (_cipher != null)
+-                    {
+-                        _avPipeline.SetCipher(_cipher);
+-                    }
+-                    
+-                    // 如果已有 headers，设置它们
++            lock (_receiverSync)
++            {
++                var oldReceiver = _receiver;
++                _receiver = receiver;
++
++                // ✅ 支持新旧两种架构
++                if (_usePipeline)
++                {
++                    // 初始化 Pipeline（如果还没有初始化）
++                    if (_avPipeline == null)
++                    {
++                        _logger.LogInformation("🚀 Initializing AV Pipeline");
++                        _avPipeline = new AVPipelineCoordinator(
++                            _loggerFactory.CreateLogger<AVPipelineCoordinator>(),
++                            _loggerFactory,
++                            _session.HostType,
++                            receiver,
++                            _cancellationToken
++                        );
++
++                        // 如果已有 cipher，设置它
++                        if (_cipher != null)
++                        {
++                            _avPipeline.SetCipher(_cipher);
++                        }
++
++                        // 如果已有 headers，设置它们
++                        if (_cachedVideoHeader != null || _cachedAudioHeader != null)
++                        {
++                            var videoProfiles = _adaptiveStreamManager?.GetAllProfiles()?.ToArray();
++                            _avPipeline.SetHeaders(_cachedVideoHeader, _cachedAudioHeader, videoProfiles);
++                        }
++
++                        // 设置回调
++                        if (_adaptiveStreamManager != null)
++                        {
++                            _avPipeline.SetAdaptiveStreamManager(_adaptiveStreamManager, OnProfileSwitched);
++                        }
++                        _avPipeline.SetRequestKeyframeCallback(RequestKeyframeAsync);
++                        _avPipeline.SetHapticsHandler(_hapticsConverter != null ? _hapticsConverter.ProcessPacket : null);
++
++                        // 启动统计监控
++                        StartPipelineStatsMonitoring();
++                    }
++                    else
++                    {
++                        // 如果 Pipeline 已存在，更新 receiver
++                        _avPipeline.SetReceiver(receiver);
++                    }
++                }
++                else
++                {
++                    // 使用旧的 AVHandler
++                    _avHandler?.SetReceiver(receiver);
++                }
++
++                // Pipeline 模式下切换接收端不经过 AVHandler.SetReceiver，需要自己把视频头和编码格式交给新接收端，
++                // 否则它不知道实际编码（例如 HEVC），无法识别关键帧
++                if (oldReceiver != null && _usePipeline)
++                {
++                    SyncStreamInfoToReceiver(receiver);
++                }
++
++                // 通知 receiver 进入等待 IDR 模式
++                receiver.EnterWaitForIdr();
++
++                if (oldReceiver != null)
++                {
++                    _logger.LogInformation("Switching receiver from {OldType} to {NewType}, requesting new IDR frame",
++                        oldReceiver.GetType().Name, receiver.GetType().Name);
++
++                    // 新接收端要从关键帧开始；不受 RequestKeyframeAsync 的冷却限制
++                    _ = SendIdrRequestAsync();
++
++                    // 不重发 CONTROLLER_CONNECTION：开流收到 STREAMINFO 时已发过一次（chiaki 也只发一次），
++                    // 切换接收端不影响主机侧的手柄状态，重发后主机可能把它当成新接入的手柄
++                }
++                else
++                {
++                    _logger.LogInformation("Receiver added to RPStream: {Type}", receiver.GetType().Name);
++
++                    // 如果已有 StreamInfo，AVHandler.SetReceiver 会自动发送
++                    // 但为了兼容性，这里也发送一次（如果 AVHandler 还没有 headers）
++                    // 实际上，AVHandler.SetReceiver 已经会检查并发送了
+                     if (_cachedVideoHeader != null || _cachedAudioHeader != null)
+                     {
+-                        var videoProfiles = _adaptiveStreamManager?.GetAllProfiles()?.ToArray();
+-                        _avPipeline.SetHeaders(_cachedVideoHeader, _cachedAudioHeader, videoProfiles);
+-                    }
+-                    
+-                    // 设置回调
+-                    if (_adaptiveStreamManager != null)
+-                    {
+-                        _avPipeline.SetAdaptiveStreamManager(_adaptiveStreamManager, OnProfileSwitched);
+-                    }
+-                    _avPipeline.SetRequestKeyframeCallback(RequestKeyframeAsync);
+-                    _avPipeline.SetHapticsHandler(_hapticsConverter != null ? _hapticsConverter.ProcessPacket : null);
+-                    
+-                    // 启动统计监控
+-                    StartPipelineStatsMonitoring();
+-                }
+-                else
+-                {
+-                    // 如果 Pipeline 已存在，更新 receiver
+-                    _avPipeline.SetReceiver(receiver);
+-                }
+-            }
+-            else
+-            {
+-                // 使用旧的 AVHandler
+-            _avHandler?.SetReceiver(receiver);
+-            }
+-
+-            // Pipeline 模式下切换接收端不经过 AVHandler.SetReceiver，需要自己把视频头和编码格式交给新接收端，
+-            // 否则它不知道实际编码（例如 HEVC），无法识别关键帧
+-            if (oldReceiver != null && _usePipeline)
+-            {
+-                SyncStreamInfoToReceiver(receiver);
+-            }
+-
+-            // 通知 receiver 进入等待 IDR 模式
+-            receiver.EnterWaitForIdr();
+-
+-            if (oldReceiver != null)
+-            {
+-                _logger.LogInformation("Switching receiver from {OldType} to {NewType}, requesting new IDR frame", 
+-                    oldReceiver.GetType().Name, receiver.GetType().Name);
+-
+-                // 新接收端要从关键帧开始；不受 RequestKeyframeAsync 的冷却限制
+-                _ = SendIdrRequestAsync();
+-
+-                // 不重发 CONTROLLER_CONNECTION：开流收到 STREAMINFO 时已发过一次（chiaki 也只发一次），
+-                // 切换接收端不影响主机侧的手柄状态，重发后主机可能把它当成新接入的手柄
+-            }
+-            else
+-            {
+-                _logger.LogInformation("Receiver added to RPStream: {Type}", receiver.GetType().Name);
+-                
+-                // 如果已有 StreamInfo，AVHandler.SetReceiver 会自动发送
+-                // 但为了兼容性，这里也发送一次（如果 AVHandler 还没有 headers）
+-                // 实际上，AVHandler.SetReceiver 已经会检查并发送了
+-                if (_cachedVideoHeader != null || _cachedAudioHeader != null)
+-                {
+-                    // ✅ 对齐：视频 header 需要添加 FFMPEG_PADDING
+-                    byte[] videoHeader = _cachedVideoHeader ?? Array.Empty<byte>();
+-                    if (_cachedVideoHeader != null && _cachedVideoHeader.Length > 0)
+-                    {
+-                        var padding = new byte[64];
+-                        var paddedHeader = new byte[_cachedVideoHeader.Length + padding.Length];
+-                        System.Buffer.BlockCopy(_cachedVideoHeader, 0, paddedHeader, 0, _cachedVideoHeader.Length);
+-                        System.Buffer.BlockCopy(padding, 0, paddedHeader, _cachedVideoHeader.Length, padding.Length);
+-                        videoHeader = paddedHeader;
+-                    }
+-                    receiver.OnStreamInfo(
+-                        videoHeader,
+-                        _cachedAudioHeader ?? Array.Empty<byte>()
+-                    );
++                        // ✅ 对齐：视频 header 需要添加 FFMPEG_PADDING
++                        byte[] videoHeader = _cachedVideoHeader ?? Array.Empty<byte>();
++                        if (_cachedVideoHeader != null && _cachedVideoHeader.Length > 0)
++                        {
++                            var padding = new byte[64];
++                            var paddedHeader = new byte[_cachedVideoHeader.Length + padding.Length];
++                            System.Buffer.BlockCopy(_cachedVideoHeader, 0, paddedHeader, 0, _cachedVideoHeader.Length);
++                            System.Buffer.BlockCopy(padding, 0, paddedHeader, _cachedVideoHeader.Length, padding.Length);
++                            videoHeader = paddedHeader;
++                        }
++                        receiver.OnStreamInfo(
++                            videoHeader,
++                            _cachedAudioHeader ?? Array.Empty<byte>()
++                        );
++                    }
+                 }
+             }
+         }
+--- a/RemotePlay/Services/Streaming/StreamingService.cs
++++ b/RemotePlay/Services/Streaming/StreamingService.cs
+@@ -21,6 +21,7 @@
+         private readonly ILoggerFactory _loggerFactory;
+         private readonly IServiceProvider _serviceProvider;
+ 
++        private readonly ConcurrentDictionary<Guid, SemaphoreSlim> _streamGates = new();
+         private readonly ConcurrentDictionary<Guid, RPStreamV2> _streams = new();
+         private readonly ConcurrentDictionary<Guid, RPStreamV2> _startingStreams = new();
+ 
+@@ -47,6 +48,17 @@
+         }
+ 
+         public async Task<bool> StartStreamAsync(Guid sessionId, bool isTest = true, CancellationToken cancellationToken = default)
++        {
++            var gate = _streamGates.GetOrAdd(sessionId, _ => new(1, 1));
++            await gate.WaitAsync(cancellationToken);
++            try
++            {
++                if (_streams.ContainsKey(sessionId)) return true;
++                return await StartStreamCoreAsync(sessionId, isTest, cancellationToken);
++            }
++            finally { gate.Release(); }
++        }
++        private async Task<bool> StartStreamCoreAsync(Guid sessionId, bool isTest, CancellationToken cancellationToken)
+         {
+             var session = await _sessionService.GetSessionAsync(sessionId, cancellationToken);
+             if (session == null) return false;
+@@ -142,8 +154,13 @@
+         /// </summary>
+         private async Task HandleStreamDisconnectAsync(Guid sessionId, RPStreamV2 stream)
+         {
++            var gate = _streamGates.GetOrAdd(sessionId, _ => new(1, 1));
++            await gate.WaitAsync();
+             try
+             {
++                bool isCurrent = _streams.TryGetValue(sessionId, out var active) && ReferenceEquals(active, stream);
++                bool isPending = _startingStreams.TryGetValue(sessionId, out var pending) && ReferenceEquals(pending, stream);
++                if (!isCurrent && !isPending) return;
+                 if (_streams.TryGetValue(sessionId, out var current) && !ReferenceEquals(current, stream))
+                 {
+                     _logger.LogInformation("Ignoring disconnect from a replaced stream {SessionId}", sessionId);
+@@ -156,7 +173,8 @@
+                 var session = await _sessionService.GetSessionAsync(sessionId);
+                 var hostId = session?.HostId;
+ 
+-                _streams.TryRemove(sessionId, out _);
++                ((ICollection<KeyValuePair<Guid, RPStreamV2>>)_streams).Remove(new(sessionId, stream));
++                ((ICollection<KeyValuePair<Guid, RPStreamV2>>)_startingStreams).Remove(new(sessionId, stream));
+ 
+                 try
+                 {
+@@ -178,6 +196,7 @@
+             {
+                 _logger.LogError(ex, "Error handling stream disconnect for session {SessionId}", sessionId);
+             }
++            finally { gate.Release(); }
+         }
+         
+         /// <summary>
+@@ -198,8 +217,10 @@
+                 var streamingHub = scope.ServiceProvider.GetRequiredService<IHubContext<StreamingHub>>();
+                 var dbContext = scope.ServiceProvider.GetRequiredService<RPContext>();
+ 
++                var owner = _serviceProvider.GetService<global::RemotePlay.Services.Lifecycle.SessionLifecycle>()?.Find(sessionId)?.Owner;
++                if (string.IsNullOrEmpty(owner)) return;
+                 var userIds = await dbContext.UserDevices
+-                    .Where(ud => ud.IsActive
++                    .Where(ud => ud.IsActive && ud.UserId == owner
+                                  && ud.Device != null
+                                  && ud.Device.HostId == hostId
+                                  && !string.IsNullOrEmpty(ud.UserId))
+--- a/RemotePlay/Services/WebRTC/WebRTCSession.cs
++++ b/RemotePlay/Services/WebRTC/WebRTCSession.cs
+@@ -14,6 +14,9 @@
+         public DateTime CreatedAt { get; init; }
+         public Guid? StreamingSessionId { get; set; }
+         public string? PreferredVideoCodec { get; init; }
++        public string OwnerId { get; set; } = string.Empty;
++        public string LifecycleToken { get; set; } = string.Empty;
++        public bool IsBound { get; set; }
+         
+         private readonly List<RTCIceCandidateInit> _pendingIceCandidates = new();
+         private readonly HashSet<string> _candidateKeys = new();
+--- a/RemotePlay/Services/WebRTC/WebRTCSignalingService.cs
++++ b/RemotePlay/Services/WebRTC/WebRTCSignalingService.cs
+@@ -33,6 +33,7 @@
+         private readonly WebRTCConfig _config;
+         private readonly PortRange? _portRange;
+         private readonly StunNetwork _stunNetwork;
++        private readonly Func<RTCConfiguration, Task>? _configureIce;
+         private readonly IServiceProvider _serviceProvider;
+         private const string TurnConfigKey = "webrtc.turn_servers";
+         private const string WebRTCConfigKey = "webrtc.config";
+@@ -44,7 +45,8 @@
+             IControllerService? controllerService = null,
+             IStreamingService? streamingService = null,
+             IOptions<WebRTCConfig>? webrtcOptions = null,
+-            IServiceProvider? serviceProvider = null)
++            IServiceProvider? serviceProvider = null,
++            Func<RTCConfiguration, Task>? configureIce = null)
+         {
+             _logger = logger;
+             _loggerFactory = loggerFactory;
+@@ -54,6 +56,7 @@
+             _sessions = new ConcurrentDictionary<string, WebRTCSession>();
+             _serviceProvider = serviceProvider ?? throw new ArgumentNullException(nameof(serviceProvider));
+ 
++            _configureIce = configureIce;
+             _stunNetwork = StunNetwork.FromEnvironment();
+             _config = webrtcOptions?.Value ?? new WebRTCConfig();
+             _portRange = CreatePortRange(_config);
+@@ -109,7 +112,8 @@
+                     iceTransportPolicy = iceTransportPolicy
+                 };
+                 
+-                await _stunNetwork.ApplyAsync(config);
++                if (_configureIce != null) await _configureIce(config);
++                else await _stunNetwork.ApplyAsync(config);
+                 if (turnServers.Count > 0)
+                 {
+                     foreach (var turn in turnServers.Where(t => !string.IsNullOrWhiteSpace(t.Url)))
+@@ -168,6 +172,11 @@
+                 };
+ 
+                 _sessions.TryAdd(sessionId, session);
++                peerConnection.onconnectionstatechange += state =>
++                {
++                    if (session.StreamingSessionId is Guid remote)
++                        _serviceProvider.GetService<global::RemotePlay.Services.Lifecycle.SessionLifecycle>()?.SetConnected(remote, session.LifecycleToken, state == RTCPeerConnectionState.connected);
++                };
+                 iceGathering.SetCandidateSink(candidate =>
+                 {
+                     session.AddPendingIceCandidate(new RTCIceCandidateInit
+@@ -190,7 +199,9 @@
+ 
+                 receiver.OnKeyframeRequested += async (s, e) =>
+                 {
+-                    if (_streamingService != null && session.StreamingSessionId.HasValue)
++                    var lifecycle = _serviceProvider.GetService<global::RemotePlay.Services.Lifecycle.SessionLifecycle>();
++                    if (_streamingService != null && session.StreamingSessionId.HasValue &&
++                        (lifecycle == null || lifecycle.IsCurrent(session.StreamingSessionId.Value, session.OwnerId, session.LifecycleToken)))
+                     {
+                         try
+                         {
+@@ -618,36 +629,12 @@
+             {
+                 try
+                 {
+-                    // 浏览器重建 WebRTC 连接时，新会话已绑定到同一个串流，旧会话移除时不能停掉串流
+-                    bool streamStillUsed = session.StreamingSessionId.HasValue &&
+-                        _sessions.Values.Any(s => s.StreamingSessionId == session.StreamingSessionId);
+-                    if (streamStillUsed)
+-                    {
+-                        _logger.LogInformation("WebRTC session {SessionId} replaced; keeping streaming session {StreamingSessionId}",
+-                            sessionId, session.StreamingSessionId!.Value);
+-                    }
+-                    else if (_streamingService != null && session.StreamingSessionId.HasValue)
+-                    {
+-                        try
+-                        {
+-                            await _streamingService.StopStreamAsync(session.StreamingSessionId.Value);
+-                        }
+-                        catch (Exception streamEx)
+-                        {
+-                            _logger.LogWarning(streamEx, "Error stopping streaming session: {StreamingSessionId}", session.StreamingSessionId.Value);
+-                        }
+-                    }
+-
+-                    if (_controllerService != null && Guid.TryParse(sessionId, out var sessionGuid))
+-                    {
+-                        try
+-                        {
+-                            await _controllerService.DisconnectAsync(sessionGuid);
+-                        }
+-                        catch (Exception controllerEx)
+-                        {
+-                            _logger.LogWarning(controllerEx, "Error disconnecting controller: {SessionId}", sessionId);
+-                        }
++                    // Removing a transport never owns the NAS-console lifetime.
++                    if (session.StreamingSessionId is Guid remoteId)
++                    {
++                        if (_streamingService != null && await _streamingService.GetStreamAsync(remoteId) is { } stream)
++                            stream.RemoveReceiver(session.Receiver);
++                        _serviceProvider.GetService<global::RemotePlay.Services.Lifecycle.SessionLifecycle>()?.Release(remoteId, session.LifecycleToken);
+                     }
+ 
+                     session.Receiver?.Dispose();
+@@ -880,7 +867,9 @@
+         public void CleanupExpiredSessions()
+         {
+             var expired = _sessions.Where(s =>
+-                (DateTime.UtcNow - s.Value.CreatedAt).TotalHours > 1
++                s.Value.StreamingSessionId is Guid remote &&
++                _serviceProvider.GetService<global::RemotePlay.Services.Lifecycle.SessionLifecycle>() is { } lifecycle &&
++                !lifecycle.Allows(remote, s.Value.OwnerId, s.Value.LifecycleToken)
+             ).ToList();
+ 
+             foreach (var session in expired)

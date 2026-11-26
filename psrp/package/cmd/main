@@ -1,6 +1,8 @@
 #!/bin/sh
 set -eu
 umask 077
+# Remove installer plaintext before exec, not just after Node has inherited it.
+unset wizard_admin_password wizard_admin_confirm
 : "${TRIM_APPDEST:?}" "${TRIM_PKGVAR:?}"
 NODE=/var/apps/nodejs_v22/target/bin/node
 if [ ! -x "$NODE" ]; then

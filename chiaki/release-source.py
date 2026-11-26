@@ -11,6 +11,9 @@ def filtered(info):
  if any(info.name.endswith(x) for x in ['.wasm','.exe','.dll','.so','.o','.a','.sqlite','.db','.key','.pem']):return None
  return info
 with tarfile.open(out,'w:gz') as t:
+ # stage-package.py/build.sh now reference these shared original packaging sources.
+ t.add(P.parent/'packaging/setup',arcname='packaging/setup',filter=filtered)
+ t.add(P.parent/'LICENSE',arcname='LICENSE',filter=filtered)
  for name in allowed:
   q=P/name
   if q.exists():t.add(q,arcname='chiaki/'+name,filter=filtered)

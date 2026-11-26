@@ -32,6 +32,7 @@ cp README.md package/app/README.md
 cp source/LICENSE package/LICENSE
 # Normalize permissions: source extraction inherits the builder umask, not fnOS policy.
 python3 collect-notices.py
+python3 ../packaging/setup/stage.py psrp package
 python3 finalize-package.py
 FNPACK=${FNPACK:-/usr/local/bin/fnpack}
 rm -f dist/psrp-web.fpk

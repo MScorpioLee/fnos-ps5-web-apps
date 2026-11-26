@@ -5,25 +5,33 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import {fileURLToPath} from 'node:url';
 import {execFileSync} from 'node:child_process';
+import {loadSettings,checkPorts} from './setup/settings.mjs';
+import {startStandalone} from './setup/standalone.mjs';
+for(const k of Object.keys(process.env))if(k.startsWith('wizard_'))delete process.env[k];
 const here=path.dirname(fileURLToPath(import.meta.url));
 const data=process.env.TRIM_PKGVAR;
 if(!data) throw Error('TRIM_PKGVAR required');
 process.umask(0o077); fs.mkdirSync(data,{recursive:true});
 const credentialFile=path.join(data,'credentials.json');
+const settings=loadSettings('chiaki',data);
+await checkPorts(settings);
 if(!fs.existsSync(credentialFile)) {
  fs.writeFileSync(credentialFile,JSON.stringify({email:'admin@localhost',password:crypto.randomBytes(24).toString('base64url')}),{mode:0o600,flag:'wx'});
 }
+if(!fs.lstatSync(credentialFile).isFile())throw Error('Unsafe credentials file');
+fs.chmodSync(credentialFile,0o600);
 const credentials=JSON.parse(fs.readFileSync(credentialFile,'utf8'));
 if(!credentials.email || !credentials.password || credentials.password.length<16)throw Error('Invalid bootstrap credentials (minimum 16 characters)');
 Object.assign(process.env,{
  CHIAKI_WASM_BIND:'127.0.0.1',CHIAKI_WASM_PORT:'10121',CHIAKI_WASM_LAN_HTTPS:'false',
  CHIAKI_AUTH_ENABLED:'true',CHIAKI_AUTH_ALLOW_REGISTER:'false',CHIAKI_RELAY_ALLOW_WAN:'false',
- CHIAKI_DB_DIR:data,CHIAKI_ADMIN_USER:'admin',CHIAKI_ADMIN_EMAIL:credentials.email,
+ CHIAKI_DB_DIR:data,CHIAKI_ADMIN_USER:credentials.username||'admin',CHIAKI_ADMIN_EMAIL:credentials.email,
  CHIAKI_ADMIN_PASSWORD:fs.existsSync(path.join(data,'chiaki.sqlite'))?'':credentials.password,CHIAKI_TRUST_PROXY:'on',
  CHIAKI_WASM_ROOT:path.join(here,'www'),CHIAKI_WASM_WWW:path.join(here,'www')
 });
 const upstream=await import('./proxy/server.mjs');
 const upstreamHandle=await upstream.startServers();
+const independent=await startStandalone(settings);
 const prefix='/app/chiaki-ng-web';
 const security={
  'Cross-Origin-Opener-Policy':'same-origin','Cross-Origin-Embedder-Policy':'require-corp',
@@ -84,5 +92,5 @@ execFileSync('/usr/bin/setfacl',['-m','u:www-data:rw-',socketPath]);
 fs.writeFileSync(path.join(data,'ready'),String(process.pid),{mode:0o600});
 console.log('fnOS gateway socket ready; HTTPS + NAS admin identity + Chiaki account required');
 let closing=false;
-async function stop(){if(closing)return;closing=true;gateway.close();await upstreamHandle.close();try{fs.unlinkSync(socketPath);}catch{}try{fs.unlinkSync(path.join(data,'ready'));}catch{}process.exit(0);}
+async function stop(){if(closing)return;closing=true;independent?.closeIndependent();gateway.close();await upstreamHandle.close();try{fs.unlinkSync(socketPath);}catch{}try{fs.unlinkSync(path.join(data,'ready'));}catch{}process.exit(0);}
 process.on('SIGTERM',stop);process.on('SIGINT',stop);

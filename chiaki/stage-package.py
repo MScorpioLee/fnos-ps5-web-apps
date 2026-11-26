@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 from pathlib import Path
-import shutil,json,zlib,struct
+import shutil,json,zlib,struct,subprocess,sys
 P=Path(__file__).resolve().parent;D=P/'package'
 for d in ['app/proxy','app/www','app/ui/images','cmd','config','wizard']: (D/d).mkdir(parents=True,exist_ok=True)
 b=P/'source/build-wasm/wasm'
@@ -29,7 +29,7 @@ desc=Native PS4/PS5 browser Remote Play; HTTPS gateway and administrator login r
 platform=x86
 source=thirdparty
 maintainer=MScorpioLee
-maintainer_url=https://github.com/MScorpioLee/fnos-ps5-web-apps
+maintainer_url=https://github.com/MScorpioLee/ps-remote-web
 os_min_version=1.2.0
 install_dep_apps=nodejs_v22
 checkport=false
@@ -51,6 +51,7 @@ for n,name in [(64,'ICON.PNG'),(256,'ICON_256.PNG')]:
 main='''#!/bin/bash
 set -eu
 umask 077
+unset wizard_admin_password wizard_admin_confirm
 : "${TRIM_APPDEST:?}" "${TRIM_PKGVAR:?}"
 NODE=/var/apps/nodejs_v22/target/bin/node
 PID="$TRIM_PKGVAR/service.pid"
@@ -95,4 +96,5 @@ for name in ['install_init','install_callback','upgrade_init','upgrade_callback'
 for q in (D/'cmd').iterdir():q.chmod(0o755)
 (D/'wizard/install').write_text(json.dumps([{'stepTitle':'HTTPS / account','items':[{'type':'tips','helpText':'Open through fnOS HTTPS gateway as NAS administrator. First start creates private credentials.json under application var; retrieve locally over SSH. Registration disabled. PS5 link PIN required. Safari is not guaranteed.'}]}]))
 (D/'wizard/uninstall').write_text(json.dumps([{'stepTitle':'Retain data','items':[{'type':'tips','helpText':'This package never deletes credentials, pairing keys or SQLite data. Back up the application var directory before uninstalling; do not select fnOS system data cleanup.'}]}]))
+subprocess.run([sys.executable,str(P.parent/'packaging/setup/stage.py'),'chiaki',str(D)],check=True)
 print('Staged real WASM:',(b/'chiaki.wasm').stat().st_size,'bytes')

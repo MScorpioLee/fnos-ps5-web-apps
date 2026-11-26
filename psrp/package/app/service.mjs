@@ -4,6 +4,9 @@ import http from 'node:http';
 import net from 'node:net';
 import crypto from 'node:crypto';
 import {spawn, spawnSync} from 'node:child_process';
+import {loadSettings,psrpEnvironment,bootstrapPSRP,checkPorts} from './setup/settings.mjs';
+import {startStandalone} from './setup/standalone.mjs';
+for(const k of Object.keys(process.env))if(k.startsWith('wizard_'))delete process.env[k];
 if(!process.env.TRIM_APPDEST||!process.env.TRIM_PKGVAR)throw Error('TRIM_APPDEST and TRIM_PKGVAR required');
 fs.mkdirSync(process.env.TRIM_PKGVAR,{recursive:true,mode:0o700});
 const A=fs.realpathSync(process.env.TRIM_APPDEST), V=fs.realpathSync(process.env.TRIM_PKGVAR);
@@ -43,11 +46,13 @@ if(process.argv[2]==='status'){
 if(process.argv[2]!=='serve')process.exit(1);
 if(process.getuid()===0)throw Error('Refusing root service; use package user');
 fs.writeFileSync(pidFile,String(process.pid),{mode:0o600});
-const children=[];let stopping=false;
+const children=[];let stopping=false,independent=null;
+const settings=loadSettings('psrp',V);
 const run=(exe,args,env=process.env)=>new Promise((resolve,reject)=>{const c=spawn(exe,args,{env,stdio:'inherit'});c.on('error',reject);c.on('exit',code=>code===0?resolve():reject(Error(exe+' exited '+code)))});
 const launch=(exe,args,env,file)=>{const c=spawn(exe,args,{env,stdio:'inherit'});children.push(c);fs.writeFileSync(path.join(V,file),String(c.pid),{mode:0o600});c.on('error',e=>{console.error(e);shutdown(1)});c.on('exit',()=>{if(!stopping){console.error('Service exited: '+exe);shutdown(1)}});return c};
 async function shutdown(code=0){
  if(stopping)return;stopping=true;
+ if(independent)independent.closeIndependent();
  for(const c of children.toReversed()){
   if(c.exitCode!==null||c.signalCode)continue;
   c.kill('SIGTERM');
@@ -59,8 +64,8 @@ async function shutdown(code=0){
 }
 process.on('SIGTERM',()=>shutdown());process.on('SIGINT',()=>shutdown());
 try{
- // Check both fixed ports before initializing or connecting to any database.
- for(const port of [10111,10112])await new Promise((resolve,reject)=>{const probe=net.createServer();probe.once('error',()=>reject(Error('Required loopback port is occupied: '+port)));probe.listen(port,'127.0.0.1',()=>probe.close(resolve))});
+ // Check all loopback listeners before initializing or connecting to a database.
+ await checkPorts(settings);
  const secretsFile=path.join(V,'secrets.json');
  if(!fs.existsSync(secretsFile))fs.writeFileSync(secretsFile,JSON.stringify({database:crypto.randomBytes(32).toString('hex'),jwt:crypto.randomBytes(64).toString('hex')}),{mode:0o600,flag:'wx'});
  fs.chmodSync(secretsFile,0o600);const secrets=JSON.parse(fs.readFileSync(secretsFile));
@@ -77,9 +82,14 @@ try{
  if(exists.status!==0)throw Error('Cannot query private PG cluster');
  if(exists.stdout.trim()!=='1')await run(path.join(pgb,'createdb'),['-h','127.0.0.1','-p','10112','-U','psrp','psrp'],dbEnv);
  const work=path.join(V,'backend');fs.mkdirSync(path.join(work,'wwwroot'),{recursive:true,mode:0o700});
- const env={...process.env,HOME:V,TMPDIR:V,ASPNETCORE_URLS:'http://127.0.0.1:10111',ASPNETCORE_ENVIRONMENT:'Production','Logging__LogLevel__Microsoft.AspNetCore':'Warning','Logging__LogLevel__Microsoft.EntityFrameworkCore':'Warning',ASPNETCORE_CONTENTROOT:work,DOTNET_PROCESSOR_COUNT:'2',ConnectionStrings__DB:`Host=127.0.0.1;Port=10112;Database=psrp;Username=psrp;Password=${secrets.database}`,JWT__Secret:secrets.jwt,JWT__Issuer:'RemotePlay',JWT__Audience:'RemotePlayClient',PATH:path.join(A,'bin')+':'+process.env.PATH};
+ const env=psrpEnvironment(settings,{...process.env,HOME:V,TMPDIR:V,ASPNETCORE_ENVIRONMENT:'Production','Logging__LogLevel__Microsoft.AspNetCore':'Warning','Logging__LogLevel__Microsoft.EntityFrameworkCore':'Warning',ASPNETCORE_CONTENTROOT:work,DOTNET_PROCESSOR_COUNT:'2',ConnectionStrings__DB:`Host=127.0.0.1;Port=10112;Database=psrp;Username=psrp;Password=${secrets.database}`,JWT__Secret:secrets.jwt,JWT__Issuer:'RemotePlay',JWT__Audience:'RemotePlayClient',PATH:path.join(A,'bin')+':'+process.env.PATH});
  delete env.LD_LIBRARY_PATH;
  await run(path.join(A,'dbtool/RemotePlay.DBTool'),[],env);
+ await bootstrapPSRP(V,settings,async sql=>{
+  // No password/hash in process arguments, subprocess output or PG error-statement logs.
+  const r=spawnSync(path.join(pgb,'psql'),['-X','-q','-v','ON_ERROR_STOP=1','-h','127.0.0.1','-p','10112','-U','psrp','-d','psrp','-f','-'],{env:{...dbEnv,PGOPTIONS:'-c log_statement=none -c log_min_error_statement=panic -c log_min_messages=panic'},input:sql,encoding:'utf8',stdio:['pipe','pipe','pipe'],timeout:30000});
+  if(r.status!==0)throw Error('Local account initialization failed; existing accounts have not been overwritten');
+ });
  launch(path.join(A,'backend/RemotePlay'),[],env,'backend.pid');
  for(let i=0;i<120;i++){try{const r=await fetch('http://127.0.0.1:10111/healthz');if(r.ok){ready=true;break}}catch{}ready=false;await new Promise(r=>setTimeout(r,250))}if(!ready)throw Error('Backend startup timeout');
  const prefix='/app/psrp-web';
@@ -116,5 +126,6 @@ try{
  });
  if(fs.existsSync(sock))fs.unlinkSync(sock);await new Promise((resolve,reject)=>{server.once('error',reject);server.listen(sock,resolve)});fs.chmodSync(sock,0o600);
  const acl=spawnSync('/usr/bin/setfacl',['-m','u:www-data:rw',sock],{encoding:'utf8'});if(acl.status!==0)throw Error('Cannot grant fnOS nginx user access to gateway socket: '+acl.stderr);
- console.log('PSRP native services ready: Unix gateway + loopback backend/private PostgreSQL. No public TCP listener.');
+ independent=await startStandalone(settings,{staticRoot:path.join(A,'www')});
+ console.log('PSRP native services ready: Unix gateway + loopback backend/private PostgreSQL; optional loopback independent entry. No public TCP listener.');
 }catch(e){console.error(e);await shutdown(1)}

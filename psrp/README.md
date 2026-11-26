@@ -1,4 +1,8 @@
-# PSRP Web — fnOS 原生版（x86_64）
+# PS remote web / PS网页串流 — PSRP 原生组件（x86_64）
+
+项目同时包含 PSRP 与 Chiaki-NG Web 两个组件；本页是 PSRP 包。新显示名不改变 `psrp-web` 内部 app ID、网关路径、包用户或数据目录，Chiaki 名称不变。
+
+项目仓库：https://github.com/MScorpioLee/ps-remote-web
 
 将 [o1298098/remote-play](https://github.com/o1298098/remote-play) 的 React 前端、ASP.NET **10** 后端和独立 PostgreSQL 15 集群打包为 `psrp-web.fpk`。**运行时和本次构建均未使用 Docker**。上游 MIT 许可证保留在 `package/LICENSE` 和包内 `licenses/PSRP-MIT`。
 
@@ -9,9 +13,9 @@
 - **从 fnOS HTTPS 入口打开**。不提供 HTTP 串流降级，HTTP 非安全上下文显示明确提示；不修改 NAS 证书或网关设置。顶层窗口避免 iframe 的手柄/WebHID 权限限制。
 - fnOS 会话校验后，应用进一步要求 `X-Trim-Userid` 和管理员标志。PSRP 仍使用自己的用户注册/登录和 JWT，不等同于单点登录。
 - 网关 Socket 仅包用户和 NAS nginx 用户 `www-data` 可读写；通过系统 `setfacl` 设置单用户 ACL，不使用 0666，不给应用附加系统组。
-- ASP.NET 只监听 `127.0.0.1:10111`，独立 PG 只监听 `127.0.0.1:10112` 和私有目录 Socket。**10110 默认不监听，也没有任何匿名公网 TCP 网页入口**。不配置端口转发、防火墙、VPN、路由。
+- ASP.NET 只监听 `127.0.0.1:10111`，独立 PG 只监听 `127.0.0.1:10112` 和私有目录 Socket。默认只有 fnOS 网关；可选独立 HTTP 入口也只监听回环，不直接公开 TCP。不配置端口转发、防火墙、VPN、路由。
 - 生命周期及常驻进程默认专用包用户 `psrp-web`，监督器明确拒绝 root。`status` 运行=0、停止=3，子服务退出时关闭整组服务；`stop` 先关闭后端串流再停 PG。
-- 数据、日志、临时文件、DataProtection key 和独立 PG 数据均在 `TRIM_PKGVAR`。`secrets.json` 首次启动随机生成 PG 密码和 JWT 密钥，权限 0600；整个生命周期以 umask 077 启动。不记录密码、JWT 或 PSN 令牌。
+- 数据、日志、临时文件、DataProtection key 和独立 PG 数据均在 `TRIM_PKGVAR`。新安装随机生成 `secrets.json` 内 PG 密码和 JWT 密钥（旧包首次启动仍有兼容生成），权限 0600；整个生命周期以 umask 077 启动。不记录密码、JWT 或 PSN 令牌。
 - 只管理自己的 PG15 集群，绝不连接系统数据库。卸载不主动删除数据。升级前建议停止应用并备份整个 `TRIM_PKGVAR`，不承诺 PG 跨大版本自动升级。
 - fnOS 网关是外部身份边界；本机 root/同包 UID 和 nginx UID 在可信边界内。后端的 loopback 端口仍应视为 NAS 本机可信进程接口。
 
@@ -30,7 +34,7 @@ chmod +x build.sh package/cmd/*
 
 `bundle-native.py` 打包本机 PG15.15 的二进制、扩展、share 和依赖库闭包，布局可迁移；FFmpeg 使用 Debian 官方 **5.1.9** `.deb`，不复制 fnOS 自带的 nonfree mediasrv FFmpeg。PG/FFmpeg 的动态库来自当前 Debian12 主机，清单和 SHA256 在包内 `licenses/BUNDLE-INVENTORY.json`。同名库优先 `/lib/x86_64-linux-gnu`，不复制专有 GPU 驱动。
 
-**公开二进制暂缓**：后续审查发现初始构建在 fnOS 限制 `dpkg-query` 权限时会漏收动态库版权告知。收集器现已改为失败即退出，并仅在必要时尝试 `sudo -n dpkg-query` 只读查询。若系统已裁剪相应 `/usr/share/doc/<package>/copyright`（当前测试机的 `libstdc++6` 即存在此情况），构建会明确失败；请在拥有精确版本完整 notices 的隔离 Debian12 构建环境处理，不要跳过验证，也不要为此擅自升级 NAS 系统。完整依赖对应源码仍需继续整理，见 [发布审查](../docs/PSRP-LICENSE-REVIEW.md)。本机已安装的预览程序仍可用于功能测试，但这不等于已满足公开分发门槛。
+**公开二进制暂缓**：后续审查发现初始构建在 fnOS 限制 `dpkg-query` 权限时会漏收动态库版权告知。收集器现已改为失败即退出，并仅在必要时尝试 `sudo -n dpkg-query` 只读查询。若系统已裁剪相应 `/usr/share/doc/<package>/copyright`（历史测试曾缺少 `libstdc++6` 告知），构建会明确失败；当前以实际检查结果为准，不能沿用历史缺失状态。请在拥有精确版本完整 notices 的隔离 Debian12 构建环境处理，不要跳过验证，也不要为此擅自升级 NAS 系统。完整依赖对应源码仍需继续整理，见 [发布审查](../docs/PSRP-LICENSE-REVIEW.md)。本机已安装的预览程序仍可用于功能测试，但这不等于已满足公开分发门槛。
 
 ### 可复现的范围与系统依赖
 
@@ -46,7 +50,34 @@ PSRP 包装代码遵循 MIT，PG 使用 PostgreSQL License，.NET 及 NuGet 各�
 
 由主任务在用户授权范围内通过 fnOS 应用中心安装 Release FPK。先安装 nodejs_v22，启动后从已登录的管理员 NAS **HTTPS** 桌面入口打开。
 
-首次 PSRP 中注册自己的本地账户，再配置 PSN 身份。PS5 需要用户在设置中启用远程游玩并生成一次性的 **8 位配对 PIN**；PIN 必须等用户提供，不扫描/猜测、不在源码保存 PSN 凭据。实际配对后依次验证视频、音频、键盘/手柄输入、重连和停止。WebRTC 会按上游逻辑创建出站/动态 UDP 会话；本包装不设置 NAT/端口映射，跨网需要单独审查。
+新安装向导只填写本地账户、密码及确认和可选网页HTTP端口；不询问域名、DDNS、证书或外部URL。后端要求的本地邮箱自动取 `<账户名>@localhost`，无需真实邮箱。首次服务启动在私有数据库迁移完成后仅向空用户表创建账户。密码16–128位，含大小写字母、数字和符号；以兼容上游的 Identity V3 PBKDF2-HMAC-SHA512（210000轮）哈希暂存，成功初始化后删除待创建标记，不保留PSRP明文密码。PSRP上游没有独立管理员角色，此本地账户和NAS管理员身份是两层不同边界。已有数据库/账户重装不重置，升级不重新创建账户。Chiaki 使用其既有本地账户初始化接口，`credentials.json` 含引导密码，限制为0600；已有SQLite时不再传入初始化密码。
+
+PSN身份另行配置。PS5 需要用户在设置中启用远程游玩并生成一次性的 **8 位配对 PIN**；PIN 必须等用户提供，不扫描/猜测、不在源码保存 PSN 凭据。实际配对后依次验证视频、音频、键盘/手柄输入、重连和停止。WebRTC 会按上游逻辑创建出站/动态 UDP 会话；本包装不设置 NAT/端口映射，跨网需要单独审查。
+
+### 可选 DDNS / Lucky / nginx 独立入口
+
+安装向导的 `wizard_http_port` **留空**时不增加监听，默认继续使用fnOS统一网关。需要HTTP服务端口供同机反代时，只设置一个未占用的1024–65535端口，例如 `18080`（只是示例，须自行确认可用）。域名、证书和Lucky/nginx反代均由用户自行配置，不是安装参数。安装脚本检查占用及与内部端口冲突；配置以0600存入 `TRIM_PKGVAR/install-settings.json`。旧数据重装时，仅显式填写的端口可更新，账户密码不变；升级向导保留现有配置、不重置密码。应用启动仍会再次检查监听冲突。
+
+该入口只绑定 `127.0.0.1:<选择端口>`，可供同NAS进程或host网络反代访问；**不适用于其他主机或隔离Docker网络直接访问**。它不是将信任 `X-Trim-*` 的fnOS网关改绑到 `0.0.0.0`：独立入口剥离所有fnOS身份及客户端转发头，通过应用自身JWT/Chiaki会话验证API及WebSocket，拒绝注册、跨Origin/缺Origin的写入及WebSocket，有限制登录请求速率。独立入口不继承fnOS登录态。TLS在反代终止，反代和本机进程属于可信边界。
+
+应用现有资源/Router路径固定为 `/app/psrp-web/`（Chiaki为 `/app/chiaki-ng-web/`），不是可配置basePath；反代必须保留此前缀，不支持站点根路径或任意子路径。独立入口只接受回环客户端，要求同机反代**覆盖**标准 `X-Forwarded-Proto: https` 并保留原始Host（包括`:8888`等非标准端口）；不接受逗号代理链，`X-Forwarded-Host`若存在必须与Host一致。完整Origin须等于该Host对应的HTTPS origin；域名可变化，无需安装时登记。反代不能透传外部请求自带的代理身份头。Lucky需开启WebSocket。已有HTTPS nginx server中的位置示例：
+
+```nginx
+location /app/psrp-web/ {
+    access_log off; # SignalR查询参数可能含access_token；或配置不记录查询串的日志格式
+    proxy_pass http://127.0.0.1:18080; # 无尾部斜杠：保留/app/psrp-web/前缀
+    proxy_http_version 1.1;
+    proxy_set_header Host $http_host; # 不用会丢掉:8888的$host
+    proxy_set_header X-Forwarded-Proto https; # 由本机TLS反代覆盖，不能透传客户端值
+    proxy_set_header X-Forwarded-Host $http_host;
+    proxy_set_header Forwarded "";
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "upgrade";
+    proxy_read_timeout 3600s;
+}
+```
+
+示例不配置证书、监听8888、DNS、防火墙或路由映射；不会由安装脚本写入系统。应用本地端口不是NAS HTTPS入口端口，也不是视频UDP端口。**网页可达不等于串流可达**：PSRP视频仍需独立ICE/STUN/TURN/NAT连通。本向导不新增UDP范围配置，不覆盖已保存的WebRTC设置。此功能的临时目录/fake app/db测试：在仓库根目录运行 `/var/apps/nodejs_v22/target/bin/node --test tests/fpk-*.test.mjs`；它不连接生产数据库，不是实际PS5视频验收。
 
 ### 本地有界冒烟
 

@@ -1,0 +1,1936 @@
+--- a/RemotePlay.DBTool/appsettings.json
++++ b/RemotePlay.DBTool/appsettings.json
+@@ -5,15 +5,5 @@
+       "Microsoft.AspNetCore": "Warning"
+     }
+   },
+-  "AllowedHosts": "*",
+-  "Database": {
+-    "Host": "192.168.100.186",
+-    "Port": 36099,
+-    "Name": "remoteplay_dev",
+-    "User": "o1298098",
+-    "Password": "o1298098"
+-  },
+-  "ConnectionStrings": {
+-    "DB": ""
+-  }
++  "AllowedHosts": "*"
+ }
+--- /dev/null
++++ b/RemotePlay.RegressionTests/DnsFixture.cs
+@@ -0,0 +1,77 @@
++using System.Net;
++using System.Net.Sockets;
++using RemotePlay.Services.WebRTC;
++using Makaretu.Dns;
++
++sealed class TestClock : TimeProvider
++{
++    long ticks;
++    public override long TimestampFrequency => TimeSpan.TicksPerSecond;
++    public override long GetTimestamp() => ticks;
++    public void Advance(int seconds) => ticks += TimeSpan.FromSeconds(seconds).Ticks;
++}
++sealed class DnsFixture : IDisposable
++{
++    readonly UdpClient socket = new(new IPEndPoint(IPAddress.Loopback, 0));
++    readonly CancellationTokenSource stop = new();
++    readonly Task worker;
++    readonly int ttl;
++    public string Mode;
++    public int Queries;
++    public bool SourceCorrect = true;
++    public TestClock Clock = new();
++    public object Network { get; }
++    public DnsFixture(string mode, int ttl = 10)
++    {
++        Mode = mode; this.ttl = ttl;
++        var type = typeof(WebRTCSignalingService).Assembly.GetType("RemotePlay.Services.WebRTC.StunNetwork")!;
++        // Transport seam only: production always uses configured DNS port 53.
++        var ctor = type.GetConstructor(new[] { typeof(IPAddress), typeof(IPEndPoint), typeof(TimeProvider) });
++        if (ctor == null) throw new Exception("source-bound DNS transport missing");
++        Network = ctor.Invoke(new object[] { IPAddress.Loopback, socket.Client.LocalEndPoint!, Clock });
++        worker = Run();
++    }
++    async Task Run()
++    {
++        try
++        {
++            while (!stop.IsCancellationRequested)
++            {
++                var received = await socket.ReceiveAsync(stop.Token);
++                Interlocked.Increment(ref Queries);
++                SourceCorrect &= received.RemoteEndPoint.Address.Equals(IPAddress.Loopback);
++                if (Mode == "silent") continue;
++                var q = new Message(); q.Read(received.Buffer);
++                var response = q.CreateResponse();
++                var ip = Mode switch {
++                    "fake" => "198.18.0.8", "private" => "10.0.0.1", "loopback" => "127.0.0.2", "linklocal" => "169.254.1.1", "multicast" => "224.0.0.1", "documentation" => "203.0.113.1", "shared" => "100.64.0.1", "reserved" => "240.0.0.1", _ => "8.8.8.8"
++                };
++                response.Answers.Add(new ARecord { Name = q.Questions[0].Name, Address = IPAddress.Parse(ip), TTL = TimeSpan.FromSeconds(ttl) });
++                if (Mode == "cname")
++                {
++                    response.Answers[0].Name = "alias.example";
++                    response.Answers.Insert(0, new CNAMERecord { Name = q.Questions[0].Name, Target = "alias.example", TTL = TimeSpan.FromSeconds(1) });
++                }
++                switch (Mode)
++                {
++                    case "id": response.Id ^= 1; break;
++                    case "question": response.Questions[0].Name = "unrelated.example"; break;
++                    case "qr": response.QR = false; break;
++                    case "opcode": response.Opcode = (MessageOperation)1; break;
++                    case "truncated": response.TC = true; break;
++                    case "rcode": response.Status = (MessageStatus)3; break;
++                    case "class": response.Questions[0].Class = (DnsClass)3; break;
++                    case "owner": response.Answers[0].Name = "unrelated.example"; break;
++                }
++                var bytes = response.ToByteArray();
++                if (Mode == "malformed") bytes = bytes[..13];
++                if (Mode == "compression") { bytes[12] = 0xc0; bytes[13] = 12; }
++                if (Mode == "source") { using var other = new UdpClient(new IPEndPoint(IPAddress.Loopback, 0)); await other.SendAsync(bytes, received.RemoteEndPoint); }
++                else await socket.SendAsync(bytes, received.RemoteEndPoint);
++            }
++        }
++        catch (OperationCanceledException) { }
++        catch (ObjectDisposedException) { }
++    }
++    public void Dispose() { stop.Cancel(); socket.Dispose(); worker.GetAwaiter().GetResult(); stop.Dispose(); }
++}
+--- /dev/null
++++ b/RemotePlay.RegressionTests/NetworkTests.cs
+@@ -0,0 +1,105 @@
++using System.Net;
++using System.Reflection;
++using RemotePlay.Services.WebRTC;
++using Microsoft.Extensions.DependencyInjection;
++using System.Net.Sockets;
++using Makaretu.Dns;
++
++static class NetworkTests
++{
++    static Type NetworkType => typeof(WebRTCSignalingService).Assembly.GetType("RemotePlay.Services.WebRTC.StunNetwork") ?? throw new Exception("independent STUN network configuration missing");
++    static object Options(string? bind, string? dns) => NetworkType.GetMethod("FromValues")!.Invoke(null, new object?[] {bind, dns})!;
++    static void Check(bool value, string message) { if (!value) throw new Exception(message); }
++    static async Task Apply(object network, SIPSorcery.Net.RTCConfiguration config)
++    {
++        var method = NetworkType.GetMethod("ApplyAsync");
++        Check(method != null, "STUN configuration application missing");
++        await (Task)method!.Invoke(network, new object[] {config})!;
++    }
++    public static async Task Defaults()
++    {
++        var config = new SIPSorcery.Net.RTCConfiguration();
++        await Apply(Options(null, null), config);
++        Check(config.X_BindAddress == null && config.iceServers.Count == 1 && config.iceServers[0].urls == "stun:stun.l.google.com:19302", "unconfigured behavior changed");
++    }
++    public static async Task DnsValidation()
++    {
++        foreach (var mode in new[] { "fake", "private", "loopback", "linklocal", "multicast", "documentation", "shared", "reserved", "id", "question", "qr", "opcode", "truncated", "rcode", "class", "owner", "malformed", "compression", "source" })
++        {
++            using var fixture = new DnsFixture(mode);
++            var config = new SIPSorcery.Net.RTCConfiguration();
++            try { await Apply(fixture.Network, config); throw new Exception("accepted invalid DNS: " + mode); }
++            catch (InvalidOperationException ex) { Check(ex.Message.Contains("STUN") && !ex.Message.Contains("127.0.0.1"), "DNS failure must be clear and private"); }
++        }
++        foreach (var mode in new[] { "valid", "cname" })
++        {
++        using var good = new DnsFixture(mode);
++        var success = new SIPSorcery.Net.RTCConfiguration();
++        await Apply(good.Network, success);
++        Check(success.X_BindAddress!.Equals(IPAddress.Loopback), "binding lost");
++        Check(success.iceServers.Count == 2 && success.iceServers.All(s => s.urls.StartsWith("stun:8.8.8.8:")), "numeric STUN whitelist missing");
++        Check(good.SourceCorrect, "DNS not sent from selected bind address");
++        }
++    }
++    public static async Task Ttl()
++    {
++        foreach (var ttl in new[] { 0, 2, 3600 })
++        {
++            using var fixture = new DnsFixture("valid", ttl);
++            await Apply(fixture.Network, new());
++            Check(fixture.Queries == 2, "expected both allowlisted queries");
++            await Apply(fixture.Network, new());
++            Check(fixture.Queries == (ttl == 0 ? 4 : 2), "zero TTL must never cache; positive TTL should cache");
++            fixture.Clock.Advance(Math.Min(ttl, 30) + 1);
++            await Apply(fixture.Network, new());
++            Check(fixture.Queries == (ttl == 0 ? 6 : 4), "TTL expiration or short maximum lifetime not honored");
++        }
++    }
++    public static async Task Timeout()
++    {
++        using var fixture = new DnsFixture("silent");
++        var timer = System.Diagnostics.Stopwatch.StartNew();
++        try { await Apply(fixture.Network, new()); throw new Exception("DNS outage fell back silently"); }
++        catch (InvalidOperationException ex) { Check(ex.Message.Contains("STUN"), "missing STUN failure"); }
++        Check(timer.Elapsed.TotalSeconds < 5, "DNS failure not bounded");
++        fixture.Mode = "valid";
++        await Apply(fixture.Network, new()); // no negative/stale error caching
++    }
++    public static async Task RealIce()
++    {
++        var oldBind = Environment.GetEnvironmentVariable("PSRP_WEBRTC_BIND_ADDRESS");
++        var oldDns = Environment.GetEnvironmentVariable("PSRP_WEBRTC_DNS_SERVER");
++        try
++        {
++            Environment.SetEnvironmentVariable("PSRP_WEBRTC_BIND_ADDRESS", oldBind ?? throw new InvalidOperationException("Set PSRP_WEBRTC_BIND_ADDRESS for opt-in integration"));
++            Environment.SetEnvironmentVariable("PSRP_WEBRTC_DNS_SERVER", oldDns ?? throw new InvalidOperationException("Set PSRP_WEBRTC_DNS_SERVER for opt-in integration"));
++            var service = new WebRTCSignalingService(Microsoft.Extensions.Logging.Abstractions.NullLogger<WebRTCSignalingService>.Instance,
++                Microsoft.Extensions.Logging.Abstractions.NullLoggerFactory.Instance, serviceProvider: new Microsoft.Extensions.DependencyInjection.ServiceCollection().BuildServiceProvider());
++            var (id, offer) = await service.CreateSessionAsync("h264");
++            try
++            {
++                var session = service.GetSession(id)!;
++                var candidates = ((SIPSorcery.Net.RtpIceChannel)session.PeerConnection.GetRtpChannel()).Candidates;
++                int host = candidates.Count(c => c.type == SIPSorcery.Net.RTCIceCandidateType.host);
++                int srflx = candidates.Count(c => c.type == SIPSorcery.Net.RTCIceCandidateType.srflx);
++                Console.WriteLine($"application ICE: host={host} srflx={srflx}; isolated service, no settings DB or PS5");
++                Check(host > 0 && srflx > 0, "application path failed to gather host+srflx");
++                Check(!offer.Contains("198.18.") && !offer.Contains("198.19."), "fakeIP leaked into SDP");
++            }
++            finally { await service.RemoveSessionAsync(id); }
++        }
++        finally { Environment.SetEnvironmentVariable("PSRP_WEBRTC_BIND_ADDRESS", oldBind); Environment.SetEnvironmentVariable("PSRP_WEBRTC_DNS_SERVER", oldDns); }
++    }
++    public static Task Configuration()
++    {
++        var defaults = Options(null, null);
++        Check(NetworkType.GetProperty("BindAddress")!.GetValue(defaults) == null, "default must remain unbound");
++        foreach (var pair in new[] { ("192.0.2.14", (string?)null), (null, "192.0.2.1"), ("hostname", "192.0.2.1"), ("0.0.0.0", "192.0.2.1"), ("::1", "192.0.2.1"), ("192.0.2.14", "SECRET_INVALID") })
++        {
++            try { Options(pair.Item1, pair.Item2); throw new Exception("accepted invalid config"); }
++            catch (TargetInvocationException ex) { Check(ex.InnerException is ArgumentException && !ex.InnerException.Message.Contains("SECRET_INVALID"), "configuration error must be clear and private"); }
++        }
++        Check(NetworkType.GetProperty("BindAddress")!.GetValue(Options("192.0.2.14", "192.0.2.1"))!.Equals(IPAddress.Parse("192.0.2.14")), "valid config rejected");
++        return Task.CompletedTask;
++    }
++}
+--- /dev/null
++++ b/RemotePlay.RegressionTests/Program.cs
+@@ -0,0 +1,235 @@
++using System.Collections.Concurrent;
++using System.Reflection;
++using System.Text.RegularExpressions;
++using Microsoft.Extensions.DependencyInjection;
++using Microsoft.Extensions.Logging;
++using Microsoft.Extensions.Logging.Abstractions;
++using RemotePlay.Services.Streaming.Receiver;
++using RemotePlay.Services.WebRTC;
++using SIPSorcery.Net;
++
++var tests = new List<(string, Func<Task>)> { ("non_OK_answer_is_failure", AnswerFailure), ("video_waits_for_negotiation_and_connection", VideoGate), ("early_ICE_candidates_reach_session", EarlyIce), ("answer_summary_is_allowlisted", SummaryPrivacy), ("answer_rejection_HTTP_400", ControllerFailure), ("video_gate_state_matrix", VideoMatrix), ("unready_video_no_keyframe_storm", NoKeyframeStorm), ("OK_answer_logs_summary", AnswerSuccess), ("session_creation_keeps_early_candidates", SessionIce), ("safari_42e01f_accepts_H26496", SafariH264Profile) };
++tests.Add(("stream_wait_timeout", StreamReadinessTests.WaitTimeout));
++tests.Add(("stream_caller_cancellation", StreamReadinessTests.CallerCancellation));
++tests.Add(("stream_startup_failure", StreamReadinessTests.StartupFailure));
++tests.Add(("stream_stop_during_startup", StreamReadinessTests.StopDuringStartup));
++tests.Add(("stream_HTTP_outcomes", StreamReadinessTests.HttpOutcomes));
++tests.Add(("stream_protocol_ready_signal", StreamReadinessTests.ProtocolReadyIsRequired));
++tests.Add(("stream_bind_waits_for_startup", StreamReadinessTests.BindBeforeStartup));
++tests.Add(("network_configuration", NetworkTests.Configuration));
++tests.Add(("network_default_preserved", NetworkTests.Defaults));
++tests.Add(("network_dns_validation", NetworkTests.DnsValidation));
++tests.Add(("network_dns_ttl", NetworkTests.Ttl));
++tests.Add(("network_dns_timeout", NetworkTests.Timeout));
++if (Environment.GetEnvironmentVariable("PSRP_RUN_STUN_INTEGRATION") == "1") tests.Add(("network_real_application_ICE", NetworkTests.RealIce));
++var selected = tests.Where(t => args.Length == 0 || args.Contains(t.Item1)).ToArray();
++Check(selected.Length > 0, "no matching regression tests selected");
++int failures = 0;
++foreach (var (name, test) in selected)
++{
++    try { await test(); Console.WriteLine($"PASS {name}"); }
++    catch (Exception ex) { failures++; Console.WriteLine($"FAIL {name}: {ex.GetBaseException().Message}"); }
++}
++Console.WriteLine($"RESULT total={selected.Length} passed={selected.Length - failures} failures={failures}");
++return failures == 0 ? 0 : 1;
++
++static void Check(bool value, string message) { if (!value) throw new Exception(message); }
++static T Field<T>(object obj, string name) => (T)obj.GetType().GetField(name, BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(obj)!;
++static WebRTCSignalingService Service(ILogger<WebRTCSignalingService>? logger = null) => new(logger ?? NullLogger<WebRTCSignalingService>.Instance, NullLoggerFactory.Instance, serviceProvider: new ServiceCollection().BuildServiceProvider());
++static string Answer(string offer, int mode) {
++    var s = Regex.Replace(offer, @"(?m)^a=fmtp:96 [^\r\n]*\r?\n", "");
++    return s.Replace("a=rtpmap:96 H264/90000", $"a=rtpmap:96 H264/90000\r\na=fmtp:96 packetization-mode={mode};profile-level-id=42001f;level-asymmetry-allowed=1")
++        .Replace("a=sendonly", "a=recvonly").Replace("a=setup:actpass", "a=setup:active");
++}
++static async Task AnswerFailure() {
++    foreach (var incompatible in new[] { "video", "audio" }) {
++        using var peer = new RTCPeerConnection(new RTCConfiguration { iceServers = new() });
++        using var receiver = new WebRTCReceiver("test", peer, NullLogger<WebRTCReceiver>.Instance, preferredVideoCodec: "h264");
++        var logger = new CaptureLogger();
++        var service = Service(logger);
++        var session = new WebRTCSession { SessionId = "test", PeerConnection = peer, Receiver = receiver };
++        Field<ConcurrentDictionary<string, WebRTCSession>>(service, "_sessions")["test"] = session;
++        var offer = peer.createOffer(); await peer.setLocalDescription(offer);
++        var answer = Answer(offer.sdp, incompatible == "video" ? 0 : 1);
++        if (incompatible == "audio") answer = Regex.Replace(answer, "opus/48000/2", "UNSUPPORTED/48000/2", RegexOptions.IgnoreCase);
++        var ok = await service.SetAnswerAsync("test", answer);
++        Check(!ok, $"{incompatible} incompatible answer incorrectly reported success (state={peer.signalingState})");
++        var expected = incompatible == "video" ? "VideoIncompatible" : "AudioIncompatible";
++        Check(logger.Messages.Any(m => m.Contains(expected)), $"fixture must fail specifically with {expected}");
++    }
++}
++
++static async Task VideoGate() {
++    var type = typeof(WebRTCReceiver).Assembly.GetType("RemotePlay.Services.Streaming.Receiver.Video.VideoPipeline")!;
++    using var peer = new RTCPeerConnection(new RTCConfiguration { iceServers = new() });
++    peer.addTrack(new MediaStreamTrack(SDPMediaTypesEnum.video, false,
++        new() { new SDPAudioVideoMediaFormat(SDPMediaTypesEnum.video, 96, "H264", 90000) }, MediaStreamStatusEnum.SendOnly));
++    var offer = peer.createOffer(); await peer.setLocalDescription(offer);
++    using var pipeline = (IDisposable)Activator.CreateInstance(type, new object?[] { null, peer, "h264" })!;
++    type.GetMethod("OnFrame")!.Invoke(pipeline, new object[] { new byte[] { 0, 0, 0, 0, 1, 0x65, 1 }, true });
++    var until = DateTime.UtcNow.AddSeconds(3);
++    while (Field<long>(pipeline, "_sentCount") + Field<long>(pipeline, "_failedCount") + Field<long>(pipeline, "_droppedCount") == 0 && DateTime.UtcNow < until) await Task.Delay(10);
++    Check(Field<long>(pipeline, "_sentCount") == 0, "video sent before stable/connected negotiation");
++    Check(Field<long>(pipeline, "_failedCount") == 0, "SendVideo attempted before negotiation; expected quiet drop, not an exception");
++    Check(Field<long>(pipeline, "_droppedCount") == 1, "unready frame must be counted as dropped");
++}
++
++static async Task EarlyIce() {
++    using var peer = new RTCPeerConnection(new RTCConfiguration { iceServers = new() });
++    // The observer used by CreateSession must subscribe first, before receiver/channel work.
++    var type = typeof(WebRTCSignalingService).Assembly.GetType("RemotePlay.Services.WebRTC.IceGatheringObserver");
++    if (type == null) {
++        // Reproduce the pre-fix service order against the real library.
++        using var oldReceiver = new WebRTCReceiver("test", peer, NullLogger<WebRTCReceiver>.Instance);
++        await Task.Delay(100);
++        var oldOffer = peer.createOffer(); await peer.setLocalDescription(oldOffer);
++        int observed = 0;
++        peer.onicecandidate += c => { if (c != null) Interlocked.Increment(ref observed); };
++        await Task.Delay(100);
++        Check(observed == ((RtpIceChannel)peer.GetRtpChannel()).Candidates.Count,
++            $"early ICE candidates lost: observed={observed}, actual={((RtpIceChannel)peer.GetRtpChannel()).Candidates.Count}");
++        return;
++    }
++    var observer = Activator.CreateInstance(type!, new object[] { peer })!;
++    await Task.Delay(100); // exercise candidate arrival before a session can be constructed
++    using var receiver = new WebRTCReceiver("test", peer, NullLogger<WebRTCReceiver>.Instance);
++    var candidates = new List<RTCIceCandidate>();
++    type!.GetMethod("SetCandidateSink")!.Invoke(observer, new object[] { (Action<RTCIceCandidate>)(c => candidates.Add(c)) });
++    var offer = peer.createOffer(); await peer.setLocalDescription(offer);
++    var completion = (Task)type.GetProperty("Completion")!.GetValue(observer)!;
++    Check(await Task.WhenAny(completion, Task.Delay(3000)) == completion, "gathering complete state did not finish wait (no null candidate event required)");
++    var actual = ((RtpIceChannel)peer.GetRtpChannel()).Candidates.Count;
++    Check(actual > 0, "isolated peer did not gather a host candidate");
++    Check((int)type.GetProperty("CandidateCount")!.GetValue(observer)! == actual, "early candidates undercounted");
++    Check(candidates.Count == actual, "pre-session candidates not replayed to pending queue");
++    // Already-complete construction must also complete without waiting for a future event.
++    var late = Activator.CreateInstance(type, new object[] { peer })!;
++    Check(((Task)type.GetProperty("Completion")!.GetValue(late)!).IsCompleted, "already complete gathering state missed");
++}
++
++static Task SummaryPrivacy() {
++    var type = typeof(WebRTCSignalingService).Assembly.GetType("RemotePlay.Services.WebRTC.AnswerVideoSummary");
++    Check(type != null, "answer video summary is missing");
++    string Summarize(string s) => (string)type!.GetMethod("Create")!.Invoke(null, new object[] { s })!;
++    var summary = Summarize("v=0\r\no=SECRET_ID 123 456 IN IP4 198.51.100.77\r\na=ice-pwd:SECRET_PWD\r\na=fingerprint:sha-256 SECRET_KEY\r\nm=audio 9 RTP/AVP 111\r\na=rtpmap:111 opus/48000/2\r\nm=video 0 RTP/AVP 96 97\r\na=rtpmap:96 H264/90000\r\na=fmtp:96 packetization-mode=0;profile-level-id=SECRET_PROFILE\r\na=rtpmap:97 SECRET_CODEC/90000\r\na=fmtp:97 packetization-mode=SECRET_MODE\r\na=candidate:1 1 UDP 1 198.51.100.77 1234 typ host\r\nm=video 9 RTP/AVP 98\r\na=rtpmap:98 VP8/90000\r\na=fmtp:98 x=SECRET_EXTRA\r\n");
++    Check(!summary.Contains("SECRET") && !summary.Contains("198.51") && !summary.Contains("ice-") && !summary.Contains("fingerprint") && !summary.Contains("opus"), "summary leaked non-allowlisted SDP data");
++    using var doc = System.Text.Json.JsonDocument.Parse(summary);
++    var videos = doc.RootElement.EnumerateArray().ToArray();
++    Check(videos.Length == 2 && videos[0].GetProperty("rejected").GetBoolean() && !videos[1].GetProperty("rejected").GetBoolean(), "video rejection flag incorrect");
++    var formats = videos[0].GetProperty("formats").EnumerateArray().ToArray();
++    Check(formats[0].GetProperty("codec").GetString() == "H264" && formats[0].GetProperty("pt").GetInt32() == 96 && formats[0].GetProperty("packetizationMode").GetString() == "0", "codec/PT/mode missing");
++    Check(formats[1].GetProperty("codec").GetString() == "other" && formats[1].GetProperty("packetizationMode").GetString() == "invalid", "untrusted tokens must not pass through");
++    Check(Summarize("not SDP SECRET") == "[]", "malformed input must not be echoed");
++    Check(Summarize("m=video 9 RTP/AVP 96\na=rtpmap:96 H264/90000").Contains("unspecified"), "missing mode must be distinguished from explicit zero");
++    return Task.CompletedTask;
++}
++
++static async Task ControllerFailure() {
++    using var peer = new RTCPeerConnection(new RTCConfiguration { iceServers = new() });
++    using var receiver = new WebRTCReceiver("test", peer, NullLogger<WebRTCReceiver>.Instance, preferredVideoCodec: "h264");
++    var service = Service();
++    Field<ConcurrentDictionary<string, WebRTCSession>>(service, "_sessions")["test"] = new WebRTCSession { SessionId = "test", PeerConnection = peer, Receiver = receiver };
++    var offer = peer.createOffer(); await peer.setLocalDescription(offer);
++    var controller = new RemotePlay.Controllers.WebRTCController(NullLogger<RemotePlay.Controllers.WebRTCController>.Instance, service, null!);
++    var response = await controller.ReceiveAnswer(new RemotePlay.Models.WebRTC.WebRTCAnswerRequest { SessionId = "test", Sdp = Answer(offer.sdp, 0) });
++    Check(response.Result is Microsoft.AspNetCore.Mvc.BadRequestObjectResult, "existing session negotiation failure must be HTTP 400, not expired/not-found or success");
++    var error = (RemotePlay.Models.Base.ApiErrorResponse)((Microsoft.AspNetCore.Mvc.BadRequestObjectResult)response.Result!).Value!;
++    Check(!error.Success && error.ErrorCode == RemotePlay.Models.Base.ErrorCode.WebRtcAnswerProcessingFailed, "incorrect answer failure code");
++}
++
++static async Task VideoMatrix() {
++    var type = typeof(WebRTCReceiver).Assembly.GetType("RemotePlay.Services.Streaming.Receiver.Video.VideoPipeline")!;
++    foreach (var fixture in new[] { (RTCPeerConnectionState.@new, "valid", false), (RTCPeerConnectionState.connecting, "valid", false), (RTCPeerConnectionState.connected, "local-empty", false), (RTCPeerConnectionState.connected, "remote-empty", false), (RTCPeerConnectionState.connected, "valid", true), (RTCPeerConnectionState.disconnected, "valid", false), (RTCPeerConnectionState.failed, "valid", false), (RTCPeerConnectionState.closed, "valid", false) }) {
++        using var peer = new RTCPeerConnection(new RTCConfiguration { iceServers = new() });
++        peer.addTrack(new MediaStreamTrack(SDPMediaTypesEnum.video, false, new() { new SDPAudioVideoMediaFormat(SDPMediaTypesEnum.video, 96, "H264", 90000) }, MediaStreamStatusEnum.SendOnly));
++        var offer = peer.createOffer(); await peer.setLocalDescription(offer);
++        Check(peer.setRemoteDescription(new RTCSessionDescriptionInit { type = RTCSdpType.answer, sdp = Answer(offer.sdp, 1) }) == SetDescriptionResultEnum.OK, "matrix fixture negotiation failed");
++        // Set only the public state property in the isolated peer; no production transport is used.
++        typeof(RTCPeerConnection).GetProperty("connectionState")!.SetValue(peer, fixture.Item1);
++        if (fixture.Item2 == "local-empty") peer.VideoLocalTrack.Capabilities.Clear();
++        if (fixture.Item2 == "remote-empty") peer.VideoRemoteTrack.Capabilities.Clear();
++        using var pipeline = (IDisposable)Activator.CreateInstance(type, new object?[] { null, peer, "h264" })!;
++        type.GetMethod("OnFrame")!.Invoke(pipeline, new object[] { new byte[] { 0, 0, 0, 0, 1, 0x65, 1 }, true });
++        var until = DateTime.UtcNow.AddSeconds(3);
++        while (Field<long>(pipeline, "_sentCount") + Field<long>(pipeline, "_failedCount") + Field<long>(pipeline, "_droppedCount") == 0 && DateTime.UtcNow < until) await Task.Delay(10);
++        Check(Field<long>(pipeline, "_sentCount") == (fixture.Item3 ? 1 : 0) && Field<long>(pipeline, "_failedCount") == 0, $"incorrect gate for {fixture.Item1}/{fixture.Item2}");
++    }
++}
++static async Task NoKeyframeStorm() {
++    var type = typeof(WebRTCReceiver).Assembly.GetType("RemotePlay.Services.Streaming.Receiver.Video.VideoPipeline")!;
++    using var peer = new RTCPeerConnection(new RTCConfiguration { iceServers = new() });
++    using var pipeline = (IDisposable)Activator.CreateInstance(type, new object?[] { null, peer, "h264" })!;
++    int requests = 0;
++    type.GetMethod("SetOnKeyframeRequest")!.Invoke(pipeline, new object[] { (Action)(() => Interlocked.Increment(ref requests)) });
++    for (int i = 1; i <= 3; i++) {
++        type.GetMethod("OnFrame")!.Invoke(pipeline, new object[] { new byte[] { 0, 0, 0, 0, 1, 0x65, 1 }, true });
++        var until = DateTime.UtcNow.AddSeconds(3);
++        while (Field<long>(pipeline, "_droppedCount") < i && DateTime.UtcNow < until) await Task.Delay(10);
++    }
++    Check(requests <= 1, $"unready video caused per-frame keyframe requests: {requests}");
++}
++
++static async Task AnswerSuccess() {
++    using var peer = new RTCPeerConnection(new RTCConfiguration { iceServers = new() });
++    using var receiver = new WebRTCReceiver("test", peer, NullLogger<WebRTCReceiver>.Instance, preferredVideoCodec: "h264");
++    var logger = new CaptureLogger();
++    var service = Service(logger);
++    Field<ConcurrentDictionary<string, WebRTCSession>>(service, "_sessions")["test"] = new WebRTCSession { SessionId = "test", PeerConnection = peer, Receiver = receiver };
++    var offer = peer.createOffer(); await peer.setLocalDescription(offer);
++    Check(await service.SetAnswerAsync("test", Answer(offer.sdp, 1)), "valid answer no longer succeeds");
++    Check(peer.signalingState == RTCSignalingState.stable, "valid answer not stable");
++    var summary = logger.Messages.Single(m => m.StartsWith("Answer video summary:"));
++    Check(summary.Contains("H264") && summary.Contains("packetizationMode") && !summary.Contains("candidate:") && !summary.Contains("fingerprint"), "safe summary missing from actual answer logs");
++    Check(!await service.SetAnswerAsync("missing", "not SDP"), "missing session must fail");
++}
++static async Task SessionIce() {
++    var service = Service(); // no RPContext registered: cannot reach any live settings DB
++    var (id, _) = await service.CreateSessionAsync("h264");
++    try {
++        var session = service.GetSession(id)!;
++        var actual = ((RtpIceChannel)session.PeerConnection.GetRtpChannel()).Candidates.Count;
++        var pending = session.GetPendingIceCandidates();
++        Check(actual > 0 && pending.Count == actual, $"CreateSession lost early candidates: pending={pending.Count}, actual={actual}");
++    } finally { await service.RemoveSessionAsync(id); }
++}
++static async Task SafariH264Profile() {
++    using var peer = new RTCPeerConnection(new RTCConfiguration { iceServers = new() });
++    using var receiver = new WebRTCReceiver("profile-test", peer, NullLogger<WebRTCReceiver>.Instance, preferredVideoCodec: "h264");
++    var offer = peer.createOffer();
++    await peer.setLocalDescription(offer);
++    var service = Service();
++    string Optimize(string sdp) => (string)typeof(WebRTCSignalingService)
++        .GetMethod("OptimizeSdpForLowLatency", BindingFlags.NonPublic | BindingFlags.Instance)!.Invoke(service, new object[] { sdp })!;
++    var wire = Optimize(offer.sdp);
++    var noFmtp = Regex.Replace(offer.sdp, @"(?m)^a=fmtp:96 [^\r\n]*\r?\n", "");
++    var old = noFmtp.Replace("a=rtpmap:96 H264/90000", "a=rtpmap:96 H264/90000\r\na=fmtp:96 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42001f");
++    var start = new System.Diagnostics.ProcessStartInfo(Environment.GetEnvironmentVariable("PSRP_BROWSER_PYTHON") ?? "python3") {
++        RedirectStandardInput = true, RedirectStandardOutput = true, RedirectStandardError = true, UseShellExecute = false
++    };
++    start.ArgumentList.Add(Path.Combine(AppContext.BaseDirectory, "safari_h264_profile.py"));
++    using var process = System.Diagnostics.Process.Start(start)!;
++    var stdout = process.StandardOutput.ReadToEndAsync();
++    var stderr = process.StandardError.ReadToEndAsync();
++    await process.StandardInput.WriteAsync(System.Text.Json.JsonSerializer.Serialize(new { old42001f = old, track = offer.sdp, wire, fallback = Optimize(noFmtp) }));
++    process.StandardInput.Close();
++    using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(45));
++    try { await process.WaitForExitAsync(timeout.Token); }
++    catch (OperationCanceledException) { process.Kill(true); throw new Exception("Chromium profile regression timed out"); }
++    Console.WriteLine(await stdout);
++    Check(process.ExitCode == 0, "actual browser/RFC6184 negotiation failed: " + await stderr);
++    Check(peer.VideoLocalTrack.Capabilities.Single().Fmtp == "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f", "track format must explicitly match wire offer");
++    Check(wire.Contains("a=fmtp:96 " + peer.VideoLocalTrack.Capabilities.Single().Fmtp), "wire fmtp differs from local track");
++    foreach (var preference in new string?[] { null, "h265", "hevc" }) {
++        using var hevcPeer = new RTCPeerConnection(new RTCConfiguration { iceServers = new() });
++        using var hevcReceiver = new WebRTCReceiver("hevc-profile-test", hevcPeer, NullLogger<WebRTCReceiver>.Instance, preferredVideoCodec: preference);
++        Check(hevcPeer.VideoLocalTrack.Capabilities.Select(c => c.ID).SequenceEqual(new[] { 97, 96 }), "HEVC preference/default order changed");
++        Check(hevcPeer.VideoLocalTrack.Capabilities.Last().Fmtp == peer.VideoLocalTrack.Capabilities.Single().Fmtp, "HEVC fallback H264 profile differs");
++    }
++}
++
++sealed class CaptureLogger : ILogger<WebRTCSignalingService> {
++    public ConcurrentQueue<string> Messages { get; } = new();
++    public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
++    public bool IsEnabled(LogLevel level) => true;
++    public void Log<TState>(LogLevel level, EventId id, TState state, Exception? ex, Func<TState, Exception?, string> formatter) => Messages.Enqueue(formatter(state, ex));
++}
+--- /dev/null
++++ b/RemotePlay.RegressionTests/RemotePlay.RegressionTests.csproj
+@@ -0,0 +1,6 @@
++<Project Sdk="Microsoft.NET.Sdk">
++  <PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net10.0</TargetFramework><ImplicitUsings>enable</ImplicitUsings><Nullable>enable</Nullable></PropertyGroup>
++  <ItemGroup><PackageReference Include="Microsoft.EntityFrameworkCore.Relational" Version="10.0.14" /></ItemGroup>
++  <ItemGroup><ProjectReference Include="../RemotePlay/RemotePlay.csproj" /></ItemGroup>
++  <ItemGroup><None Update="safari_h264_profile.py;safari_h264_match.cjs" CopyToOutputDirectory="PreserveNewest" /></ItemGroup>
++</Project>
+--- /dev/null
++++ b/RemotePlay.RegressionTests/StreamReadinessTests.cs
+@@ -0,0 +1,190 @@
++using System.Collections.Concurrent;
++using System.Reflection;
++using Microsoft.AspNetCore.Http;
++using Microsoft.AspNetCore.Mvc;
++using Microsoft.Extensions.DependencyInjection;
++using Microsoft.Extensions.Logging.Abstractions;
++using RemotePlay.Contracts.Services;
++using RemotePlay.Controllers;
++using RemotePlay.Models.PlayStation;
++using RemotePlay.Services.Streaming;
++using RemotePlay.Services.Streaming.Core;
++using RemotePlay.Services.Streaming.Receiver;
++using RemotePlay.Services.WebRTC;
++using SIPSorcery.Net;
++
++static class StreamReadinessTests
++{
++    static void Check(bool value, string message) { if (!value) throw new Exception(message); }
++    static (RemoteSession Session, StreamingService Service) Fixture(string host = "127.0.0.1")
++    {
++        var session = new RemoteSession { HostIp = host };
++        var proxy = DispatchProxy.Create<ISessionService, SessionProxy>();
++        ((SessionProxy)(object)proxy).Session = session;
++        return (session, new StreamingService(NullLogger<StreamingService>.Instance, proxy, NullLoggerFactory.Instance, new ServiceCollection().BuildServiceProvider()));
++    }
++    static async Task Expect<T>(Task task) where T : Exception
++    {
++        try { await task.WaitAsync(TimeSpan.FromSeconds(5)); }
++        catch (T) { return; }
++        throw new Exception($"expected {typeof(T).Name}");
++    }
++    public static async Task WaitTimeout()
++    {
++        var (session, service) = Fixture();
++        await Expect<TimeoutException>(service.WaitForStreamAsync(session.Id, TimeSpan.Zero));
++        Check(!session.StreamReady.Task.IsCompleted, "caller timeout poisoned shared readiness");
++        Check(await service.WaitForStreamAsync(Guid.NewGuid(), TimeSpan.Zero) == null, "missing session must stay missing");
++    }
++    public static async Task CallerCancellation()
++    {
++        var (session, service) = Fixture();
++        using var cancel = new CancellationTokenSource();
++        var canceled = service.WaitForStreamAsync(session.Id, TimeSpan.FromSeconds(10), cancel.Token);
++        var other = service.WaitForStreamAsync(session.Id, TimeSpan.FromSeconds(10));
++        cancel.Cancel();
++        await Expect<OperationCanceledException>(canceled);
++        Check(!other.IsCompleted && !session.StreamReady.Task.IsCompleted, "one canceled bind poisoned other waiters");
++        await service.StopStreamAsync(session.Id);
++        await Expect<OperationCanceledException>(other);
++    }
++    public static async Task StartupFailure()
++    {
++        var (session, service) = Fixture("not-an-IP");
++        var binding = service.WaitForStreamAsync(session.Id, TimeSpan.FromSeconds(10));
++        await Expect<FormatException>(service.StartStreamAsync(session.Id, false));
++        await Expect<InvalidOperationException>(binding);
++        Check(!await service.IsStreamRunningAsync(session.Id), "failed stream was published");
++    }
++    public static async Task StopDuringStartup()
++    {
++        var session = new RemoteSession { HostIp = "127.0.0.1" };
++        var proxy = DispatchProxy.Create<ISessionService, SessionProxy>();
++        ((SessionProxy)(object)proxy).Session = session;
++        using var logger = new StartupLoggerFactory();
++        var service = new StreamingService(NullLogger<StreamingService>.Instance, proxy, logger, new ServiceCollection().BuildServiceProvider());
++        var binding = service.WaitForStreamAsync(session.Id, TimeSpan.FromSeconds(10));
++        var startup = service.StartStreamAsync(session.Id, false);
++        await logger.Initialized.Task.WaitAsync(TimeSpan.FromSeconds(3));
++        await service.StopStreamAsync(session.Id);
++        await Expect<OperationCanceledException>(binding);
++        await Expect<OperationCanceledException>(startup);
++        Check(!await service.IsStreamRunningAsync(session.Id), "stopped startup published late");
++    }
++
++    public static async Task HttpOutcomes()
++    {
++        foreach (var (error, expected, text) in new (Exception, int, string)[] {
++            (new TimeoutException(), 504, "超时"),
++            (new OperationCanceledException(), 499, "取消"),
++            (new InvalidOperationException(), 502, "启动失败")
++        }) {
++            using var services = new ServiceCollection().BuildServiceProvider();
++            var signaling = new WebRTCSignalingService(NullLogger<WebRTCSignalingService>.Instance, NullLoggerFactory.Instance, serviceProvider: services);
++            using var peer = new RTCPeerConnection(new RTCConfiguration { iceServers = new() });
++            using var receiver = new WebRTCReceiver("outcome", peer, NullLogger<WebRTCReceiver>.Instance, preferredVideoCodec: "h264");
++            ((ConcurrentDictionary<string, WebRTCSession>)typeof(WebRTCSignalingService).GetField("_sessions", BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(signaling)!)["outcome"] = new WebRTCSession { SessionId = "outcome", PeerConnection = peer, Receiver = receiver };
++            var streaming = DispatchProxy.Create<IStreamingService, StreamingFailureProxy>();
++            ((StreamingFailureProxy)(object)streaming).Error = error;
++            var controller = new WebRTCController(NullLogger<WebRTCController>.Instance, signaling, streaming) { ControllerContext = new ControllerContext { HttpContext = new DefaultHttpContext() } };
++            var response = await controller.ConnectToRemotePlaySession("outcome", Guid.NewGuid().ToString());
++            var result = response.Result as ObjectResult;
++            Check(result?.StatusCode == expected, $"{error.GetType().Name}: expected HTTP {expected}, got {result?.StatusCode}");
++            Check(((RemotePlay.Models.Base.ApiErrorResponse)result!.Value!).ErrorMessage!.Contains(text), "failure categories indistinguishable");
++        }
++    }
++
++    public static async Task ProtocolReadyIsRequired()
++    {
++        var session = new RemoteSession { HostIp = "127.0.0.1" };
++        var proxy = DispatchProxy.Create<ISessionService, SessionProxy>();
++        ((SessionProxy)(object)proxy).Session = session;
++        var services = new ServiceCollection().BuildServiceProvider();
++        var streaming = new StreamingService(NullLogger<StreamingService>.Instance, proxy, NullLoggerFactory.Instance, services);
++        var signal = typeof(RPStreamV2).GetProperty("Ready");
++        Check(signal != null, "StartAsync only sends INIT; protocol-ready completion signal missing");
++        var stream = new RPStreamV2(NullLogger<RPStreamV2>.Instance, NullLoggerFactory.Instance, session, "127.0.0.1", 9296, default);
++        var ready = (Task)signal!.GetValue(stream)!;
++        Check(!ready.IsCompleted, "protocol readiness completed before handshake");
++        typeof(RPStreamV2).GetMethod("SetReady", BindingFlags.NonPublic | BindingFlags.Instance)!.Invoke(stream, null);
++        await ready.WaitAsync(TimeSpan.FromSeconds(3));
++        await stream.StopAsync();
++    }
++
++    public static async Task BindBeforeStartup()
++    {
++        var session = new RemoteSession { HostIp = "127.0.0.1" };
++        var proxy = DispatchProxy.Create<ISessionService, SessionProxy>();
++        ((SessionProxy)(object)proxy).Session = session;
++        var services = new ServiceCollection().BuildServiceProvider();
++        using var transportLog = new StartupLoggerFactory();
++        var streaming = new StreamingService(NullLogger<StreamingService>.Instance, proxy, transportLog, services);
++        var signaling = new WebRTCSignalingService(NullLogger<WebRTCSignalingService>.Instance, NullLoggerFactory.Instance, serviceProvider: services);
++        using var peer = new RTCPeerConnection(new RTCConfiguration { iceServers = new() });
++        using var receiver = new WebRTCReceiver("readiness", peer, NullLogger<WebRTCReceiver>.Instance, preferredVideoCodec: "h264");
++        var rtc = new WebRTCSession { SessionId = "readiness", PeerConnection = peer, Receiver = receiver };
++        ((ConcurrentDictionary<string, WebRTCSession>)typeof(WebRTCSignalingService).GetField("_sessions", BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(signaling)!)["readiness"] = rtc;
++        var controller = new WebRTCController(NullLogger<WebRTCController>.Instance, signaling, streaming) {
++            ControllerContext = new ControllerContext { HttpContext = new DefaultHttpContext() }
++        };
++        var latch = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
++        var producerEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
++        // Exactly the production ordering: session already returned, producer not yet ready.
++        Task<ActionResult<RemotePlay.Models.Base.ResponseModel>> binding = null!;
++        var producer = Produce();
++        await producerEntered.Task;
++        binding = controller.ConnectToRemotePlaySession("readiness", session.Id.ToString());
++        try {
++            Check(!binding.IsCompleted, "bind returned stream-not-found while startup is still latched");
++            Check(!await streaming.IsStreamRunningAsync(session.Id), "unready stream exposed publicly");
++        } finally { latch.TrySetResult(); }
++        await producer;
++        var response = await binding.WaitAsync(TimeSpan.FromSeconds(3));
++        Check(response.Result is OkObjectResult && rtc.StreamingSessionId == session.Id, "ready stream was not bound");
++        await streaming.StopStreamAsync(session.Id);
++        async Task Produce() {
++            producerEntered.SetResult();
++            await latch.Task;
++            // Run the real startup against loopback only, and hold the protocol-ready transition.
++            var startup = streaming.StartStreamAsync(session.Id, false);
++            await transportLog.Initialized.Task.WaitAsync(TimeSpan.FromSeconds(3));
++            Check(!await streaming.IsStreamRunningAsync(session.Id), "INIT-only stream exposed before protocol ready");
++            Check(!binding.IsCompleted, "binding completed before protocol ready");
++            var pending = (ConcurrentDictionary<Guid, RPStreamV2>)typeof(StreamingService).GetField("_startingStreams", BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(streaming)!;
++            typeof(RPStreamV2).GetMethod("SetReady", BindingFlags.NonPublic | BindingFlags.Instance)!.Invoke(pending[session.Id], null);
++            Check(await startup.WaitAsync(TimeSpan.FromSeconds(3)), "real stream startup failed");
++        }
++    }
++}
++
++sealed class StartupLoggerFactory : Microsoft.Extensions.Logging.ILoggerFactory
++{
++    public TaskCompletionSource Initialized { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
++    public Microsoft.Extensions.Logging.ILogger CreateLogger(string category) => new StartupLogger(Initialized);
++    public void AddProvider(Microsoft.Extensions.Logging.ILoggerProvider provider) { }
++    public void Dispose() { }
++    sealed class StartupLogger(TaskCompletionSource initialized) : Microsoft.Extensions.Logging.ILogger
++    {
++        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
++        public bool IsEnabled(Microsoft.Extensions.Logging.LogLevel level) => true;
++        public void Log<TState>(Microsoft.Extensions.Logging.LogLevel level, Microsoft.Extensions.Logging.EventId id, TState state, Exception? ex, Func<TState, Exception?, string> format)
++        {
++            if (format(state, ex).StartsWith("RPStream started,")) initialized.TrySetResult();
++        }
++    }
++}
++
++public class StreamingFailureProxy : DispatchProxy
++{
++    public Exception Error { get; set; } = null!;
++    protected override object? Invoke(MethodInfo? method, object?[]? args) => Task.FromException<RPStreamV2?>(Error);
++}
++
++public class SessionProxy : DispatchProxy
++{
++    public RemoteSession? Session { get; set; }
++    protected override object? Invoke(MethodInfo? method, object?[]? args) => method!.Name switch {
++        "GetSessionAsync" => Task.FromResult(Session != null && (Guid)args![0]! == Session.Id ? Session : null),
++        _ => throw new NotSupportedException(method.Name)
++    };
++}
+--- /dev/null
++++ b/RemotePlay.RegressionTests/safari_h264_match.cjs
+@@ -0,0 +1,24 @@
++// Real RFC 6184 profile negotiation library used by mediasoup-client.
++// Dependency: h264-profile-level-id@2.3.3 (set NODE_PATH if external).
++const h264 = require('h264-profile-level-id');
++let input = '';
++process.stdin.on('data', data => input += data);
++process.stdin.on('end', () => {
++  const offers = JSON.parse(input);
++  const safari = {'profile-level-id': '42e01f', 'packetization-mode': 1, 'level-asymmetry-allowed': 1};
++  const results = {};
++  for (const [name, sdp] of Object.entries(offers)) {
++    const fmtp = /^a=fmtp:96 ([^\r\n]*)/m.exec(sdp)?.[1] || '';
++    const params = Object.fromEntries(fmtp.split(';').filter(Boolean).map(p => p.trim().split('=')));
++    let profileAnswer, error;
++    try { profileAnswer = h264.generateProfileLevelIdStringForAnswer(safari, params); }
++    catch (e) { error = e.message; }
++    results[name] = {accepted: !error && h264.isSameProfile(safari, params) && Number(params['packetization-mode'] || 0) === 1,
++      profileAnswer, error, payloadType: 96, profile: h264.parseSdpProfileLevelId(params)};
++  }
++  console.log(JSON.stringify({library: 'h264-profile-level-id@2.3.3', cases: results}));
++  if (results.old42001f.accepted) throw new Error('negative control: baseline 42001f unexpectedly accepted');
++  for (const name of ['track', 'wire', 'fallback']) {
++    if (!results[name].accepted) throw new Error(`${name}: Safari 42e01f rejected H26496`);
++  }
++});
+--- /dev/null
++++ b/RemotePlay.RegressionTests/safari_h264_profile.py
+@@ -0,0 +1,60 @@
++"""Real Chromium negotiation with Safari's constrained-baseline H264 preference.
++Requires Playwright and an installed Chromium; never downloads a browser.
++"""
++import asyncio
++import json
++import os
++from pathlib import Path
++import sys
++import subprocess
++from playwright.async_api import async_playwright
++
++JS = r"""async offer => {
++  const pc = new RTCPeerConnection({iceServers: []});
++  try {
++    const codecs = RTCRtpReceiver.getCapabilities('video').codecs.filter(c =>
++      c.mimeType.toLowerCase() === 'video/h264' &&
++      /(?:^|;)profile-level-id=42e01f(?:;|$)/i.test(c.sdpFmtpLine || '') &&
++      /(?:^|;)packetization-mode=1(?:;|$)/.test(c.sdpFmtpLine || ''));
++    if (!codecs.length) throw new Error('Chromium missing required 42e01f capability');
++    const transceiver = pc.addTransceiver('video', {direction: 'recvonly'});
++    try {
++      await pc.setRemoteDescription({type: 'offer', sdp: offer});
++      transceiver.setCodecPreferences(codecs);
++      const answer = await pc.createAnswer();
++      await pc.setLocalDescription(answer);
++      const video = answer.sdp.split(/(?=m=)/).find(s => s.startsWith('m=video '));
++      const lines = video.split(/\r?\n/);
++      return {accepted: !/^m=video 0 /.test(video) && lines.includes('a=rtpmap:96 H264/90000'),
++        video: lines.filter(s => /^(m=|a=rtpmap:|a=fmtp:)/.test(s)), preferences: codecs};
++    } catch (e) { return {accepted: false, error: e.name + ': ' + e.message, preferences: codecs}; }
++  } finally { pc.close(); }
++}"""
++
++async def main():
++    offers = json.load(sys.stdin)
++    async with async_playwright() as pw:
++        executable = os.environ.get('PSRP_CHROMIUM_PATH')
++        if not executable:
++            installed = sorted((Path.home() / '.cache/ms-playwright').glob('chromium-*/chrome-linux64/chrome'))
++            if installed:
++                executable = str(installed[-1])
++        browser = await pw.chromium.launch(headless=True, **({'executable_path': executable} if executable else {}))
++        try:
++            page = await browser.new_page()
++            results = {name: await page.evaluate(JS, sdp) for name, sdp in offers.items()}
++            print(json.dumps({'engine': 'chromium', 'version': browser.version, 'cases': results}))
++            # Chromium is intentionally not the Safari rejection oracle: it accepts
++            # baseline 42001f even with constrained-baseline codec preferences.
++            # The real RFC 6184 library below provides strict profile matching.
++            for name in ('track', 'wire', 'fallback'):
++                assert results[name]['accepted'], f'{name}: Safari-filtered 42e01f preferences rejected H26496'
++        finally:
++            await browser.close()
++    match = subprocess.run(['node', str(Path(__file__).with_name('safari_h264_match.cjs'))],
++                           input=json.dumps(offers), text=True, capture_output=True)
++    print(match.stdout, end='')
++    if match.returncode:
++        raise AssertionError(match.stderr)
++
++asyncio.run(main())
+--- a/RemotePlay.Web/.env
++++ b/RemotePlay.Web/.env
+@@ -1 +1 @@
+-VITE_API_BASE_URL=http://192.168.100.130:5094/api
++VITE_API_BASE_URL=/app/psrp-web/api
+--- a/RemotePlay.Web/index.html
++++ b/RemotePlay.Web/index.html
+@@ -12,7 +12,8 @@
+     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+     <meta name="apple-mobile-web-app-title" content="Remote Play" />
+     <title>Remote Play - 远程游戏串流</title>
+-  </head>
++  <script>if(!window.isSecureContext){document.addEventListener("DOMContentLoaded",()=>{document.getElementById("root").innerHTML="<h2>PSRP requires HTTPS</h2><p>Please open the fnOS HTTPS gateway. WebCodecs, audio and gamepad APIs require a secure context.</p>";});}</script>
++</head>
+   <body>
+     <div id="root"></div>
+     <script type="module" src="/src/main.tsx"></script>
+--- a/RemotePlay.Web/src/App.tsx
++++ b/RemotePlay.Web/src/App.tsx
+@@ -26,7 +26,7 @@
+     <ThemeProvider>
+       <AuthProvider>
+         <GamepadProvider>
+-          <BrowserRouter>
++          <BrowserRouter basename="/app/psrp-web">
+             <Routes>
+               <Route path="/login" element={<Login />} />
+               <Route path="/register" element={<Register />} />
+--- a/RemotePlay.Web/src/main.tsx
++++ b/RemotePlay.Web/src/main.tsx
+@@ -6,7 +6,7 @@
+ 
+ ReactDOM.createRoot(document.getElementById('root')!).render(
+   <React.StrictMode>
+-    <App />
++    {window.isSecureContext ? <App /> : <main><h1>PSRP requires HTTPS</h1><p>请从 fnOS 的 HTTPS 统一网关打开；WebCodecs、音频和手柄需要安全上下文。</p></main>}
+   </React.StrictMode>,
+ )
+ 
+--- a/RemotePlay.Web/src/utils/auth-invalidation.ts
++++ b/RemotePlay.Web/src/utils/auth-invalidation.ts
+@@ -62,7 +62,7 @@
+   // 使用微任务确保其他清理逻辑先执行
+   Promise.resolve().then(() => {
+     if (window.location.pathname !== '/login') {
+-      window.location.replace('/login')
++      window.location.replace('/app/psrp-web/login')
+     } else {
+       invalidationInProgress = false
+     }
+--- a/RemotePlay.Web/vite.config.ts
++++ b/RemotePlay.Web/vite.config.ts
+@@ -5,6 +5,7 @@
+ 
+ // https://vitejs.dev/config/
+ export default defineConfig({
++  base: '/app/psrp-web/',
+   plugins: [
+     react(),
+     VitePWA({
+@@ -17,8 +18,8 @@
+         short_name: 'Remote Play',
+         description: 'PlayStation 远程游戏串流',
+         lang: 'zh-CN',
+-        start_url: '/',
+-        scope: '/',
++        start_url: '/app/psrp-web/',
++        scope: '/app/psrp-web/',
+         display: 'standalone',
+         background_color: '#020817',
+         theme_color: '#2563eb',
+@@ -33,7 +34,7 @@
+         globPatterns: ['**/*.{js,css,html,ico,png,svg,jpg,woff2}'],
+         cleanupOutdatedCaches: true,
+         // 后端接口与 SignalR 必须直连网络，不能被 SPA 回退到 index.html
+-        navigateFallbackDenylist: [/^\/api/, /^\/hubs/, /^\/swagger/],
++        navigateFallbackDenylist: [/\/api(?:\/|$)/, /\/hubs(?:\/|$)/, /\/swagger(?:\/|$)/],
+       },
+     }),
+   ],
+--- a/RemotePlay/Contracts/Services/IStreamingService.cs
++++ b/RemotePlay/Contracts/Services/IStreamingService.cs
+@@ -10,6 +10,7 @@
+         Task<bool> StopStreamAsync(Guid sessionId, CancellationToken cancellationToken = default);
+         Task<bool> AttachReceiverAsync(Guid sessionId, IAVReceiver receiver, CancellationToken cancellationToken = default);
+         Task<RPStreamV2?> GetStreamAsync(Guid sessionId);
++        Task<RPStreamV2?> WaitForStreamAsync(Guid sessionId, TimeSpan timeout, CancellationToken cancellationToken = default);
+         Task<RemoteSession?> GetSessionAsync(Guid sessionId);
+         Task<bool> IsStreamRunningAsync(Guid sessionId);
+         Task<bool> ForceResetReorderQueueAsync(Guid sessionId);
+--- a/RemotePlay/Controllers/PlayStationController.cs
++++ b/RemotePlay/Controllers/PlayStationController.cs
+@@ -568,7 +568,7 @@
+             _logger.LogInformation("✅ HLS receiver attached");
+ 
+             // 返回可直接访问的 URL（静态文件已启用）
+-            var publicUrl = $"/hls/{sessionId:N}/index.m3u8";
++            var publicUrl = $"/app/psrp-web/hls/{sessionId:N}/index.m3u8";
+             return Ok(new ApiSuccessResponse<object>
+             {
+                 Success = true,
+--- a/RemotePlay/Controllers/WebRTCController.cs
++++ b/RemotePlay/Controllers/WebRTCController.cs
+@@ -154,11 +154,11 @@
+                 }
+                 else
+                 {
+-                    return NotFound(new ApiErrorResponse
+-                    {
+-                        Success = false,
+-                        ErrorMessage = "会话不存在或已过期",
+-                        ErrorCode = ErrorCode.WebRtcSessionExpired
++                    return BadRequest(new ApiErrorResponse
++                    {
++                        Success = false,
++                        ErrorMessage = "Answer 协商失败，请重新建立 WebRTC 会话",
++                        ErrorCode = ErrorCode.WebRtcAnswerProcessingFailed
+                     });
+                 }
+             }
+@@ -425,7 +425,8 @@
+                 }
+                 
+                 // 获取流实例
+-                var stream = await _streamingService.GetStreamAsync(sessionGuid);
++                var stream = await _streamingService.WaitForStreamAsync(sessionGuid, TimeSpan.FromSeconds(30),
++                    HttpContext?.RequestAborted ?? CancellationToken.None);
+                 if (stream == null)
+                 {
+                     return NotFound(new ApiErrorResponse
+@@ -455,6 +456,19 @@
+                     Data = true,
+                     Message = "连接成功"
+                 });
++            }
++            catch (TimeoutException)
++            {
++                return StatusCode(504, new ApiErrorResponse { Success = false, ErrorMessage = "等待远程播放流就绪超时", ErrorCode = ErrorCode.WebRtcConnectionFailed });
++            }
++            catch (OperationCanceledException)
++            {
++                return StatusCode(499, new ApiErrorResponse { Success = false, ErrorMessage = "远程播放流绑定已取消（会话停止或请求取消）", ErrorCode = ErrorCode.WebRtcConnectionFailed });
++            }
++            catch (InvalidOperationException ex)
++            {
++                _logger.LogWarning(ex, "Remote Play stream startup failed");
++                return StatusCode(502, new ApiErrorResponse { Success = false, ErrorMessage = "远程播放流启动失败", ErrorCode = ErrorCode.WebRtcConnectionFailed });
+             }
+             catch (Exception ex)
+             {
+--- a/RemotePlay/Middleware/HlsPathFixMiddleware.cs
++++ b/RemotePlay/Middleware/HlsPathFixMiddleware.cs
+@@ -110,7 +110,7 @@
+                             
+                             // 构建基础 URL（确保使用正斜杠）
+                             var dirPath = path.Substring(0, path.LastIndexOf('/') + 1);
+-                            var baseUrl = $"{context.Request.Scheme}://{context.Request.Host}{dirPath}";
++                            var baseUrl = $"/app/psrp-web{dirPath}";
+                             
+                             // 使用更简单的方法处理路径转换，并过滤已删除的 .ts 文件
+                             var lines = m3u8Content.Split(new[] { '\r', '\n' }, StringSplitOptions.None);
+--- a/RemotePlay/Models/PlayStation/RemoteSession.cs
++++ b/RemotePlay/Models/PlayStation/RemoteSession.cs
+@@ -45,6 +45,15 @@
+         public int MtuIn { get; set; } = 1454;    // MTU IN, default 1454
+         public int MtuOut { get; set; } = 1454;   // MTU OUT, default 1454
+ 
++        // Separate from SESSION_ID: true only after the stream is safe to bind.
++        [System.Text.Json.Serialization.JsonIgnore]
++        public TaskCompletionSource<bool> StreamReady { get; internal set; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
++
++        [System.Text.Json.Serialization.JsonIgnore]
++        public CancellationTokenSource StreamLifetime { get; } = new();
++        [System.Text.Json.Serialization.JsonIgnore]
++        public Exception? StreamStartFailure { get; internal set; }
++
+         // 会话就绪信号：收到并存储 SessionId 后置为完成
+         public TaskCompletionSource<bool> SessionReady { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+     }
+--- a/RemotePlay/Program.cs
++++ b/RemotePlay/Program.cs
+@@ -143,7 +143,7 @@
+ });
+ 
+ // 提高日志级别，便于握手/串流排查
+-builder.Logging.SetMinimumLevel(LogLevel.Debug);
++builder.Logging.SetMinimumLevel(LogLevel.Information);
+ builder.Logging.AddConsole();
+ 
+ #region Add Database
+@@ -272,6 +272,7 @@
+ #endregion
+ 
+ var app = builder.Build();
++app.MapGet("/healthz", () => Results.Ok(new { status = "ok" }));
+ 
+ // Configure the HTTP request pipeline.
+ if (app.Environment.IsDevelopment())
+--- a/RemotePlay/Services/Session/SessionService.cs
++++ b/RemotePlay/Services/Session/SessionService.cs
+@@ -144,6 +144,8 @@
+         {
+             if (_sessions.TryRemove(sessionId, out var entry))
+             {
++                entry.Session.StreamLifetime.Cancel();
++                entry.Session.StreamReady.TrySetCanceled();
+                 try
+                 {
+                     // 自动断开控制器
+@@ -700,6 +702,11 @@
+                             }
+                             catch (Exception ex)
+                             {
++                                if (_sessions.TryGetValue(sessionId, out var failedEntry))
++                                {
++                                    failedEntry.Session.StreamStartFailure = ex;
++                                    failedEntry.Session.StreamReady.TrySetResult(false);
++                                }
+                                 _logger.LogWarning(ex, "Failed to auto-start streaming test");
+                             }
+                         }
+@@ -708,6 +715,11 @@
+             }
+             catch (Exception ex)
+             {
++                if (_sessions.TryGetValue(sessionId, out var failedEntry))
++                {
++                    failedEntry.Session.StreamStartFailure = ex;
++                    failedEntry.Session.StreamReady.TrySetResult(false);
++                }
+                 _logger.LogDebug(ex, "Session receive loop error");
+             }
+         }
+--- a/RemotePlay/Services/Streaming/Core/RPStreamV2.cs
++++ b/RemotePlay/Services/Streaming/Core/RPStreamV2.cs
+@@ -360,6 +360,9 @@
+         /// <summary>
+         /// 启动流
+         /// </summary>
++        private readonly TaskCompletionSource<bool> _ready = new(TaskCreationOptions.RunContinuationsAsynchronously);
++        public Task Ready => _ready.Task;
++
+         public async Task StartAsync()
+         {
+             _logger.LogInformation("Starting RPStream to {Host}:{Port}", _host, _port);
+@@ -397,6 +400,7 @@
+                 return;
+             }
+             
++            _ready.TrySetCanceled();
+             _isStopping = true;
+             _isReconnecting = false; // ✅ 清除重连标志
+             _isReady = false; // ✅ 立即停止心跳循环和卡顿检测任务
+@@ -2617,6 +2621,7 @@
+             {
+                 StartHeartbeatLoop();
+             }
++            _ready.TrySetResult(true);
+         }
+         
+         /// <summary>
+--- a/RemotePlay/Services/Streaming/Receiver/Video/VideoPipeline.cs
++++ b/RemotePlay/Services/Streaming/Receiver/Video/VideoPipeline.cs
+@@ -206,9 +206,21 @@
+             {
+                 await foreach (var frame in _channel.Reader.ReadAllAsync(_cts.Token))
+                 {
+-                    if (_peerConnection.connectionState is RTCPeerConnectionState.closed or RTCPeerConnectionState.failed)
+-                    {
+-                        Interlocked.Increment(ref _failedCount);
++                    // A failed answer can empty SIPSorcery's negotiated formats. Do not call
++                    // SendVideo until negotiation and transport are both ready.
++                    if (_peerConnection.signalingState != RTCSignalingState.stable ||
++                        _peerConnection.connectionState != RTCPeerConnectionState.connected ||
++                        _peerConnection.remoteDescription == null ||
++                        _peerConnection.VideoLocalTrack?.Capabilities?.Count is not > 0 ||
++                        _peerConnection.VideoRemoteTrack?.Capabilities?.Count is not > 0)
++                    {
++                        lock (_stateLock)
++                        {
++                            _waitingForIdr = true;
++                            _waitingSinceTicks = Stopwatch.GetTimestamp();
++                        }
++                        _lastSentArrivalTicks = 0;
++                        Interlocked.Increment(ref _droppedCount);
+                         continue;
+                     }
+ 
+--- a/RemotePlay/Services/Streaming/Receiver/WebRTCReceiver.cs
++++ b/RemotePlay/Services/Streaming/Receiver/WebRTCReceiver.cs
+@@ -237,18 +237,6 @@
+                 {
+                     StartKeepalive();
+                 }
+-            };
+-            
+-            // 监听 ICE gathering 状态变化
+-            _peerConnection.onicegatheringstatechange += (state) =>
+-            {
+-                // ICE gathering 状态变化日志已移除
+-            };
+-            
+-            // 监听 ICE candidates
+-            _peerConnection.onicecandidate += (candidate) =>
+-            {
+-                // ICE candidate 日志已移除
+             };
+             
+             // ✅ 监听 RTCP 反馈（PLI/FIR 关键帧请求、接收报告）
+@@ -449,7 +437,8 @@
+                 SDPMediaTypesEnum.video,
+                 96,
+                 "H264",
+-                90000
++                90000,
++                fmtp: "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f"
+             );
+             
+             // ✅ 添加 HEVC 支持（Chrome 136+ 支持）
+--- a/RemotePlay/Services/Streaming/StreamingService.cs
++++ b/RemotePlay/Services/Streaming/StreamingService.cs
+@@ -22,6 +22,7 @@
+         private readonly IServiceProvider _serviceProvider;
+ 
+         private readonly ConcurrentDictionary<Guid, RPStreamV2> _streams = new();
++        private readonly ConcurrentDictionary<Guid, RPStreamV2> _startingStreams = new();
+ 
+         public StreamingService(
+             ILogger<StreamingService> logger, 
+@@ -49,10 +50,26 @@
+         {
+             var session = await _sessionService.GetSessionAsync(sessionId, cancellationToken);
+             if (session == null) return false;
++            // Coalesce binds/duplicate starts onto the same in-flight readiness signal.
++            if (_startingStreams.ContainsKey(sessionId))
++                return await session.StreamReady.Task.WaitAsync(TimeSpan.FromSeconds(30), cancellationToken);
++            TaskCompletionSource<bool> ready;
++            lock (session)
++            {
++                if (session.StreamReady.Task.IsCompleted)
++                    session.StreamReady = new(TaskCreationOptions.RunContinuationsAsynchronously);
++                ready = session.StreamReady;
++                session.StreamStartFailure = null;
++            }
++            using var lifetime = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, session.StreamLifetime.Token);
++            RPStreamV2? starting = null;
++            try
++            {
++            lifetime.Token.ThrowIfCancellationRequested();
+             var rpLogger = _loggerFactory.CreateLogger<Core.RPStreamV2>();
+             // PS5 默认使用 9296 作为首选端口
+             var port = 9296;
+-            var ct = cancellationToken;
++            var ct = lifetime.Token;
+             var streamingConfig = _serviceProvider.GetService<IOptions<RemotePlayConfig>>()?.Value.Streaming ?? new StreamingConfig();
+             var rp = new Core.RPStreamV2(rpLogger, _loggerFactory, session, session.HostIp, port, ct,
+                 streamingConfig.PacketLossReportedMax,
+@@ -86,9 +103,38 @@
+             // 设置断开连接回调。捕获本次流实例，避免旧流的断开回调拆掉后启动的新流。
+             rp.SetOnDisconnectCallback(() => HandleStreamDisconnectAsync(sessionId, rp));
+             
++            starting = rp;
++            if (!_startingStreams.TryAdd(sessionId, rp))
++                throw new InvalidOperationException("远程播放流正在启动");
+             await rp.StartAsync();
+-            _streams[sessionId] = rp;
++            await rp.Ready.WaitAsync(TimeSpan.FromSeconds(30), lifetime.Token);
++            lock (session)
++            {
++                lifetime.Token.ThrowIfCancellationRequested();
++                if (ready.Task.IsCompleted) throw new OperationCanceledException("远程播放流已停止");
++                _streams[sessionId] = rp;
++                ready.TrySetResult(true);
++            }
+             return true;
++            }
++            catch (OperationCanceledException)
++            {
++                ready.TrySetCanceled();
++                if (starting != null) { starting.SetOnDisconnectCallback(null); await starting.StopAsync(); }
++                throw;
++            }
++            catch (Exception ex)
++            {
++                session.StreamStartFailure = ex;
++                ready.TrySetResult(false);
++                if (starting != null) { starting.SetOnDisconnectCallback(null); await starting.StopAsync(); }
++                throw;
++            }
++            finally
++            {
++                if (starting != null)
++                    ((ICollection<KeyValuePair<Guid, RPStreamV2>>)_startingStreams).Remove(new(sessionId, starting));
++            }
+         }
+         
+         /// <summary>
+@@ -195,6 +241,17 @@
+ 
+         public async Task<bool> StopStreamAsync(Guid sessionId, CancellationToken cancellationToken = default)
+         {
++            var session = await _sessionService.GetSessionAsync(sessionId, cancellationToken);
++            if (session != null)
++            {
++                lock (session) { session.StreamReady.TrySetCanceled(); }
++            }
++            var stoppedPending = _startingStreams.TryRemove(sessionId, out var pending);
++            if (stoppedPending)
++            {
++                pending!.SetOnDisconnectCallback(null);
++                await pending.StopAsync();
++            }
+             if (_streams.TryRemove(sessionId, out var rp))
+             {
+                 try 
+@@ -223,7 +280,7 @@
+                 }
+                 return true;
+             }
+-            return false;
++            return stoppedPending;
+         }
+ 
+         /// <summary>
+@@ -309,6 +366,22 @@
+             }
+         }
+ 
++        public async Task<RPStreamV2?> WaitForStreamAsync(Guid sessionId, TimeSpan timeout, CancellationToken cancellationToken = default)
++        {
++            cancellationToken.ThrowIfCancellationRequested();
++            var session = await _sessionService.GetSessionAsync(sessionId, cancellationToken);
++            if (session == null) return null;
++            if (!await session.StreamReady.Task.WaitAsync(timeout, cancellationToken))
++            {
++                if (session.StreamStartFailure is TimeoutException)
++                    throw new TimeoutException("等待远程播放流就绪超时", session.StreamStartFailure);
++                throw new InvalidOperationException("远程播放流启动失败", session.StreamStartFailure);
++            }
++            cancellationToken.ThrowIfCancellationRequested();
++            if (!session.IsActive) throw new OperationCanceledException("远程播放会话已停止");
++            return await GetStreamAsync(sessionId);
++        }
++
+         public Task<RPStreamV2?> GetStreamAsync(Guid sessionId)
+         {
+             _streams.TryGetValue(sessionId, out var stream);
+--- /dev/null
++++ b/RemotePlay/Services/WebRTC/AnswerVideoSummary.cs
+@@ -0,0 +1,66 @@
++using System.Text.Json;
++
++namespace RemotePlay.Services.WebRTC;
++
++/// <summary>Allowlisted diagnostics only. Never serialize SDP or arbitrary attribute values.</summary>
++internal static class AnswerVideoSummary
++{
++    private sealed class Video
++    {
++        public bool Rejected;
++        public Dictionary<int, Format> Formats = new();
++    }
++
++    private sealed class Format
++    {
++        public string Codec = "other";
++        public string PacketizationMode = "unspecified";
++    }
++
++    public static string Create(string sdp)
++    {
++        var videos = new List<Video>();
++        Video? video = null;
++        foreach (var raw in sdp.Split('\n'))
++        {
++            var line = raw.Trim();
++            if (line.StartsWith("m=", StringComparison.Ordinal))
++            {
++                video = null;
++                var parts = line.Split(' ', StringSplitOptions.RemoveEmptyEntries);
++                if (parts.Length < 4 || parts[0] != "m=video") continue;
++                video = new Video { Rejected = parts[1].Split('/')[0] == "0" };
++                foreach (var pt in parts.Skip(3))
++                    if (int.TryParse(pt, out int id) && id is >= 0 and <= 127)
++                        video.Formats.TryAdd(id, new Format());
++                videos.Add(video);
++                continue;
++            }
++            if (video == null) continue;
++            bool rtpmap = line.StartsWith("a=rtpmap:", StringComparison.Ordinal);
++            bool fmtp = line.StartsWith("a=fmtp:", StringComparison.Ordinal);
++            if (!rtpmap && !fmtp) continue;
++            var attribute = line[(line.IndexOf(':') + 1)..].Split(' ', 2, StringSplitOptions.RemoveEmptyEntries);
++            if (attribute.Length != 2 || !int.TryParse(attribute[0], out int payload) || !video.Formats.TryGetValue(payload, out var format)) continue;
++            if (rtpmap)
++            {
++                var codec = attribute[1].Split('/')[0].ToUpperInvariant();
++                format.Codec = codec is "H264" or "H265" or "VP8" or "VP9" or "AV1" or "RTX" or "RED" or "ULPFEC" or "FLEXFEC-03" ? codec : "other";
++            }
++            else
++            {
++                foreach (var parameter in attribute[1].Split(';'))
++                {
++                    var pair = parameter.Split('=', 2, StringSplitOptions.TrimEntries);
++                    if (pair.Length == 2 && pair[0].Equals("packetization-mode", StringComparison.OrdinalIgnoreCase))
++                        format.PacketizationMode = pair[1] is "0" or "1" or "2" ? pair[1] : "invalid";
++                }
++            }
++        }
++        return JsonSerializer.Serialize(videos.Select(v => new
++        {
++            rejected = v.Rejected,
++            formats = v.Formats.Select(f => new { codec = f.Value.Codec, pt = f.Key, packetizationMode = f.Value.PacketizationMode })
++        }));
++    }
++}
+--- /dev/null
++++ b/RemotePlay/Services/WebRTC/IceGatheringObserver.cs
+@@ -0,0 +1,64 @@
++using SIPSorcery.Net;
++
++namespace RemotePlay.Services.WebRTC;
++
++/// <summary>
++/// Subscribe immediately after peer creation: SIPSorcery replays existing candidates
++/// only to the first subscriber. Buffer them until the session's queue is available.
++/// </summary>
++internal sealed class IceGatheringObserver
++{
++    private readonly RTCPeerConnection _peer;
++    private readonly object _gate = new();
++    private readonly Dictionary<string, RTCIceCandidate> _candidates = new();
++    private Action<RTCIceCandidate>? _sink;
++    private readonly TaskCompletionSource<bool> _completion = new(TaskCreationOptions.RunContinuationsAsynchronously);
++
++    public IceGatheringObserver(RTCPeerConnection peer)
++    {
++        _peer = peer;
++        peer.onicecandidate += OnCandidate;
++        peer.onicegatheringstatechange += state =>
++        {
++            if (state == RTCIceGatheringState.complete) _completion.TrySetResult(true);
++        };
++        // Gathering can have completed before event subscription.
++        CheckComplete();
++    }
++
++    public Task Completion { get { CheckComplete(); return _completion.Task; } }
++    public bool IsComplete { get { CheckComplete(); return _completion.Task.IsCompleted; } }
++    public int CandidateCount { get { lock (_gate) return _candidates.Count; } }
++    public int HostCount => CountType("host");
++    public int SrflxCount => CountType("srflx");
++    public int RelayCount => CountType("relay");
++
++    public void SetCandidateSink(Action<RTCIceCandidate> sink)
++    {
++        lock (_gate)
++        {
++            _sink = sink;
++            foreach (var candidate in _candidates.Values) sink(candidate);
++        }
++    }
++
++    private void OnCandidate(RTCIceCandidate candidate)
++    {
++        // This library need not emit a null end-of-candidates sentinel.
++        if (candidate?.candidate == null) return;
++        lock (_gate)
++        {
++            if (_candidates.TryAdd(candidate.candidate, candidate)) _sink?.Invoke(candidate);
++        }
++    }
++
++    private void CheckComplete()
++    {
++        if (_peer.iceGatheringState == RTCIceGatheringState.complete) _completion.TrySetResult(true);
++    }
++
++    private int CountType(string type)
++    {
++        lock (_gate) return _candidates.Values.Count(c => c.candidate.Contains("typ " + type, StringComparison.OrdinalIgnoreCase));
++    }
++}
+--- /dev/null
++++ b/RemotePlay/Services/WebRTC/StunNetwork.cs
+@@ -0,0 +1,195 @@
++using System.Buffers.Binary;
++using System.Net;
++using System.Net.Sockets;
++using System.Security.Cryptography;
++using Makaretu.Dns;
++using SIPSorcery.Net;
++
++namespace RemotePlay.Services.WebRTC;
++
++// Only the built-in STUN allowlist uses this resolver. User TURN is never rewritten.
++internal sealed class StunNetwork
++{
++    private static readonly (string Host, int Port)[] Servers =
++        [("stun.l.google.com", 19302), ("stun.cloudflare.com", 3478)];
++    public IPAddress? BindAddress { get; }
++    public IPAddress? DnsServer => _dnsEndpoint?.Address;
++    private readonly IPEndPoint? _dnsEndpoint;
++    private readonly TimeProvider _clock;
++    private readonly SemaphoreSlim _gate = new(1, 1);
++
++    public StunNetwork(IPAddress? bind, IPEndPoint? dns, TimeProvider clock)
++    { BindAddress = bind; _dnsEndpoint = dns; _clock = clock; }
++
++    public static StunNetwork FromEnvironment() => FromValues(
++        Environment.GetEnvironmentVariable("PSRP_WEBRTC_BIND_ADDRESS"),
++        Environment.GetEnvironmentVariable("PSRP_WEBRTC_DNS_SERVER"));
++
++    public static StunNetwork FromValues(string? bind, string? dns)
++    {
++        if (string.IsNullOrEmpty(bind) && string.IsNullOrEmpty(dns)) return new(null, null, TimeProvider.System);
++        static bool Valid(string? value, out IPAddress? ip) => IPAddress.TryParse(value, out ip)
++            && ip.AddressFamily == AddressFamily.InterNetwork && !ip.Equals(IPAddress.Any)
++            && !ip.Equals(IPAddress.Broadcast) && ip.GetAddressBytes()[0] < 224;
++        if (!Valid(bind, out var b) || !Valid(dns, out var d))
++            throw new ArgumentException("PSRP_WEBRTC_BIND_ADDRESS and PSRP_WEBRTC_DNS_SERVER must both be concrete IPv4 addresses.");
++        return new(b, new IPEndPoint(d!, 53), TimeProvider.System);
++    }
++
++    public async Task ApplyAsync(RTCConfiguration config)
++    {
++        if (BindAddress == null)
++        {
++            config.iceServers = new() { new() { urls = "stun:stun.l.google.com:19302" } };
++            return;
++        }
++        await _gate.WaitAsync();
++        try
++        {
++            var servers = new List<RTCIceServer>();
++            foreach (var (host, port) in Servers)
++            {
++                try
++                {
++                    var result = await ResolveAsync(host);
++                    foreach (var address in result.Addresses)
++                        servers.Add(new RTCIceServer { urls = $"stun:{address}:{port}" });
++                }
++                catch (Exception ex) when (ex is SocketException or OperationCanceledException or InvalidDataException or FormatException or ArgumentException or EndOfStreamException)
++                {
++                    // Deliberately do not attach exceptions containing endpoints or packet data.
++                }
++            }
++            if (servers.Count == 0)
++                throw new InvalidOperationException("Independent STUN DNS resolution failed: no validated global IPv4 answers; system DNS fallback is disabled.");
++            config.iceServers = servers;
++            config.X_BindAddress = BindAddress;
++        }
++        finally { _gate.Release(); }
++    }
++
++    // At most two entries (the fixed allowlist), no negative or stale fallback cache.
++    private readonly Dictionary<string, (Answer Value, long Started)> _cache = new();
++    private async Task<Answer> ResolveAsync(string host)
++    {
++        if (_cache.TryGetValue(host, out var entry)
++            && _clock.GetElapsedTime(entry.Started) < entry.Value.Ttl) return entry.Value;
++        _cache.Remove(host);
++        var started = _clock.GetTimestamp();
++        var result = await QueryAsync(host);
++        if (result.Ttl > TimeSpan.Zero && _clock.GetElapsedTime(started) < result.Ttl)
++            _cache[host] = (result, started);
++        return result;
++    }
++    private sealed record Answer(IPAddress[] Addresses, TimeSpan Ttl);
++    private async Task<Answer> QueryAsync(string host)
++    {
++        using var timeout = new CancellationTokenSource(TimeSpan.FromMilliseconds(1500));
++        using var udp = new UdpClient(new IPEndPoint(BindAddress!, 0));
++        // Connected UDP filters source IP AND port in the kernel; explicit equality is defense in depth.
++        udp.Connect(_dnsEndpoint!);
++        var query = new Message { Id = (ushort)RandomNumberGenerator.GetInt32(65536), RD = true };
++        query.Questions.Add(new Question { Name = host, Type = DnsType.A, Class = DnsClass.IN });
++        await udp.SendAsync(query.ToByteArray(), timeout.Token);
++        var received = await udp.ReceiveAsync(timeout.Token);
++        if (!received.RemoteEndPoint.Equals(_dnsEndpoint)) throw new InvalidDataException();
++        var bytes = SafeAnswerEnvelope(received.Buffer);
++        var reply = new Message();
++        reply.Read(bytes); // Reuse the already-shipped Makaretu.Dns wire codec, not a custom DNS decoder.
++        if (reply.Id != query.Id || !reply.IsResponse || reply.Opcode != query.Opcode || reply.TC
++            || reply.Z != 0 || reply.Status != 0 || reply.Questions.Count != 1)
++            throw new InvalidDataException();
++        var question = reply.Questions[0];
++        if (question.Name != query.Questions[0].Name || question.Type != DnsType.A || question.Class != DnsClass.IN)
++            throw new InvalidDataException();
++        var name = question.Name;
++        var ttl = TimeSpan.FromSeconds(30);
++        // Only accept A records for the requested owner, or a bounded in-answer CNAME chain.
++        for (int depth = 0; depth < 8; depth++)
++        {
++            var records = reply.Answers.Where(r => r.Name == name && r.Class == DnsClass.IN).ToArray();
++            var aliases = records.OfType<CNAMERecord>().ToArray();
++            var addresses = records.OfType<ARecord>().ToArray();
++            if (aliases.Length == 0)
++            {
++                var valid = addresses.Where(r => IsGlobalIPv4(r.Address)).ToArray();
++                if (valid.Length == 0) throw new InvalidDataException();
++                foreach (var record in valid) if (record.TTL < ttl) ttl = record.TTL;
++                return new(valid.Select(r => r.Address).Distinct().Take(4).ToArray(), ttl);
++            }
++            if (aliases.Length != 1 || addresses.Length != 0) throw new InvalidDataException();
++            if (aliases[0].TTL < ttl) ttl = aliases[0].TTL;
++            name = aliases[0].Target;
++        }
++        throw new InvalidDataException();
++    }
++
++    private static bool IsGlobalIPv4(IPAddress ip)
++    {
++        if (ip.AddressFamily != AddressFamily.InterNetwork) return false;
++        var b = ip.GetAddressBytes();
++        // Conservative IANA special-use exclusions, including benchmark/fakeIP 198.18/15.
++        return !(b[0] is 0 or 10 or 127 || b[0] >= 224
++            || b[0] == 100 && b[1] is >= 64 and <= 127
++            || b[0] == 169 && b[1] == 254 || b[0] == 172 && b[1] is >= 16 and <= 31
++            || b[0] == 192 && (b[1] == 168 || b[1] == 0 && b[2] is 0 or 2 || b[1] == 88 && b[2] == 99)
++            || b[0] == 198 && (b[1] is 18 or 19 || b[1] == 51 && b[2] == 100)
++            || b[0] == 203 && b[1] == 0 && b[2] == 113);
++    }
++
++    // Bound packet size/counts and compressed names before invoking the library. Only
++    // A/CNAME answer payloads are decoded; unused authority/additional RDATA is skipped.
++    private static byte[] SafeAnswerEnvelope(byte[] data)
++    {
++        if (data.Length is < 12 or > 4096) throw new InvalidDataException();
++        int U16(int p) { if (p + 2 > data.Length) throw new InvalidDataException(); return BinaryPrimitives.ReadUInt16BigEndian(data.AsSpan(p, 2)); }
++        int Name(int p)
++        {
++            int end = -1, length = 0;
++            for (int steps = 0; steps < 128; steps++)
++            {
++                if (p >= data.Length) throw new InvalidDataException();
++                int start = p, n = data[p++];
++                if (n == 0) return end < 0 ? p : end;
++                if ((n & 0xc0) == 0xc0)
++                {
++                    if (p >= data.Length) throw new InvalidDataException();
++                    int target = ((n & 63) << 8) | data[p++];
++                    if (target < 12 || target >= start) throw new InvalidDataException();
++                    if (end < 0) end = p;
++                    p = target;
++                }
++                else
++                {
++                    if (n > 63 || p + n > data.Length || (length += n + 1) > 254) throw new InvalidDataException();
++                    p += n;
++                }
++            }
++            throw new InvalidDataException();
++        }
++        if (U16(4) != 1) throw new InvalidDataException();
++        int answers = U16(6), others = U16(8) + U16(10);
++        if (answers > 16 || others > 32) throw new InvalidDataException();
++        int offset = Name(12) + 4, answerEnd = offset;
++        if (offset > data.Length) throw new InvalidDataException();
++        for (int i = 0; i < answers + others; i++)
++        {
++            offset = Name(offset);
++            if (offset + 10 > data.Length) throw new InvalidDataException();
++            int type = U16(offset), count = U16(offset + 8);
++            offset += 10;
++            if (offset + count > data.Length) throw new InvalidDataException();
++            if (i < answers)
++            {
++                if (type == 1 && count != 4 || type == 5 && Name(offset) != offset + count || type is not (1 or 5))
++                    throw new InvalidDataException();
++            }
++            offset += count;
++            if (i < answers) answerEnd = offset;
++        }
++        if (offset != data.Length) throw new InvalidDataException();
++        var result = data[..answerEnd];
++        result.AsSpan(8, 4).Clear();
++        return result;
++    }
++}
+--- a/RemotePlay/Services/WebRTC/WebRTCSignalingService.Sdp.cs
++++ b/RemotePlay/Services/WebRTC/WebRTCSignalingService.Sdp.cs
+@@ -78,7 +78,7 @@
+                         continue;
+ 
+                     if (videoCodec == "H264" && !ptsWithFmtp.Contains(pt))
+-                        optimizedLines.Add($"a=fmtp:{pt} level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42001f");
++                        optimizedLines.Add($"a=fmtp:{pt} level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f");
+ 
+                     foreach (var fb in new[] { $"a=rtcp-fb:{pt} nack pli", $"a=rtcp-fb:{pt} ccm fir" })
+                     {
+--- a/RemotePlay/Services/WebRTC/WebRTCSignalingService.cs
++++ b/RemotePlay/Services/WebRTC/WebRTCSignalingService.cs
+@@ -32,6 +32,7 @@
+         private readonly IStreamingService? _streamingService;
+         private readonly WebRTCConfig _config;
+         private readonly PortRange? _portRange;
++        private readonly StunNetwork _stunNetwork;
+         private readonly IServiceProvider _serviceProvider;
+         private const string TurnConfigKey = "webrtc.turn_servers";
+         private const string WebRTCConfigKey = "webrtc.config";
+@@ -53,6 +54,7 @@
+             _sessions = new ConcurrentDictionary<string, WebRTCSession>();
+             _serviceProvider = serviceProvider ?? throw new ArgumentNullException(nameof(serviceProvider));
+ 
++            _stunNetwork = StunNetwork.FromEnvironment();
+             _config = webrtcOptions?.Value ?? new WebRTCConfig();
+             _portRange = CreatePortRange(_config);
+ 
+@@ -101,15 +103,13 @@
+                 
+                 var config = new RTCConfiguration
+                 {
+-                    iceServers = new List<RTCIceServer>
+-                    {
+-                        new RTCIceServer { urls = "stun:stun.l.google.com:19302" },
+-                    },
++                    // Independent STUN settings never rewrite user TURN URLs or credentials.
+                     bundlePolicy = RTCBundlePolicy.max_bundle,
+                     rtcpMuxPolicy = RTCRtcpMuxPolicy.require,
+                     iceTransportPolicy = iceTransportPolicy
+                 };
+                 
++                await _stunNetwork.ApplyAsync(config);
+                 if (turnServers.Count > 0)
+                 {
+                     foreach (var turn in turnServers.Where(t => !string.IsNullOrWhiteSpace(t.Url)))
+@@ -126,6 +126,7 @@
+                 var portRange = CreatePortRange(webrtcConfig);
+                 
+                 var peerConnection = new RTCPeerConnection(config, portRange: portRange);
++                var iceGathering = new IceGatheringObserver(peerConnection);
+ 
+                 RTCDataChannel? keepaliveDataChannel = null;
+                 try
+@@ -167,6 +168,15 @@
+                 };
+ 
+                 _sessions.TryAdd(sessionId, session);
++                iceGathering.SetCandidateSink(candidate =>
++                {
++                    session.AddPendingIceCandidate(new RTCIceCandidateInit
++                    {
++                        candidate = EnsureCandidateHasUfrag(candidate.candidate, peerConnection),
++                        sdpMid = candidate.sdpMid,
++                        sdpMLineIndex = candidate.sdpMLineIndex
++                    });
++                });
+ 
+                 receiver.OnDisconnected += async (s, e) =>
+                 {
+@@ -200,154 +210,28 @@
+                 var offer = peerConnection.createOffer();
+                 await peerConnection.setLocalDescription(offer);
+ 
+-                var tcs = new TaskCompletionSource<bool>();
+-                int candidateCount = 0;
+-                int hostCandidateCount = 0;
+-                int srflxCandidateCount = 0;
+-                int relayCandidateCount = 0;
+-                bool gatheringComplete = false;
+                 bool hasTurnServers = turnServers.Count > 0;
+-                bool isForceUseTurn = webrtcConfig.ForceUseTurn && hasTurnServers;
+-                var startTime = DateTime.UtcNow;
+-                const int minWaitTimeForTurnMs = 2000;
+-
+-                bool CheckAndCompleteEarly()
+-                {
+-                    if (!hasTurnServers || gatheringComplete || relayCandidateCount < 1)
+-                        return false;
+-
+-                    var elapsedMs = (DateTime.UtcNow - startTime).TotalMilliseconds;
+-                    if (elapsedMs < minWaitTimeForTurnMs)
+-                        return false;
+-
+-                    bool canEarlyComplete = elapsedMs >= minWaitTimeForTurnMs && relayCandidateCount >= 1;
+-
+-                    if (canEarlyComplete)
+-                    {
+-                        gatheringComplete = true;
+-                        tcs.TrySetResult(true);
+-                        return true;
+-                    }
+-
+-                    return false;
+-                }
+-
+-                peerConnection.onicecandidate += (candidate) =>
+-                {
+-                    if (candidate != null)
+-                    {
+-                        candidateCount++;
+-                        
+-                        var candidateStr = candidate.candidate?.ToLowerInvariant() ?? "";
+-                        if (candidateStr.Contains("typ host"))
+-                            hostCandidateCount++;
+-                        else if (candidateStr.Contains("typ srflx"))
+-                            srflxCandidateCount++;
+-                        else if (candidateStr.Contains("typ relay"))
+-                        {
+-                            relayCandidateCount++;
+-                            CheckAndCompleteEarly();
+-                        }
+-                        
+-                        try { peerConnection.addLocalIceCandidate(candidate); }
+-                        catch { }
+-                        
+-                        try
+-                        {
+-                            if (_sessions.TryGetValue(sessionId, out var existingSession))
+-                            {
+-                                var candidateWithUfrag = EnsureCandidateHasUfrag(candidate.candidate, existingSession.PeerConnection);
+-                                
+-                                existingSession.AddPendingIceCandidate(new RTCIceCandidateInit
+-                                {
+-                                    candidate = candidateWithUfrag,
+-                                    sdpMid = candidate.sdpMid,
+-                                    sdpMLineIndex = candidate.sdpMLineIndex
+-                                });
+-                            }
+-                        }
+-                        catch (Exception ex)
+-                        {
+-                            _logger.LogWarning(ex, "Failed to store ICE candidate: SessionId={SessionId}", sessionId);
+-                        }
+-                    }
+-                    else
+-                    {
+-                        gatheringComplete = true;
+-                        tcs.TrySetResult(true);
+-                    }
+-                };
+-
++                bool isForceUseTurn = shouldForceUseTurn && hasTurnServers;
+                 int baseTimeoutMs = isForceUseTurn ? 15000 : (hasTurnServers ? 10000 : 2000);
+                 int waitTimeoutMs = baseTimeoutMs + (turnServers.Count * 3000);
+-                
+-                if (hasTurnServers)
+-                {
+-                    const int checkIntervalMs = 500;
+-                    var remainingTime = waitTimeoutMs;
+-                    
+-                    while (!gatheringComplete && remainingTime > 0)
+-                    {
+-                        var checkDelay = Math.Min(checkIntervalMs, remainingTime);
+-                        await Task.WhenAny(tcs.Task, Task.Delay(checkDelay));
+-                        
+-                        if (tcs.Task.IsCompleted)
+-                        {
+-                            break;
+-                        }
+-                        
+-                        if (CheckAndCompleteEarly())
+-                        {
+-                            break;
+-                        }
+-                        
+-                        remainingTime -= checkDelay;
+-                    }
+-                }
+-                else
+-                {
+-                    await Task.WhenAny(tcs.Task, Task.Delay(waitTimeoutMs));
+-                }
+-
+-                if (!gatheringComplete)
+-                {
+-                    _logger.LogWarning("ICE gathering incomplete (waited {Timeout}ms), collected {Count} candidates (host={Host}, srflx={Srflx}, relay={Relay})", 
+-                        waitTimeoutMs, candidateCount, hostCandidateCount, srflxCandidateCount, relayCandidateCount);
+-                    
+-                    if (hasTurnServers)
+-                    {
+-                        if (relayCandidateCount == 0)
+-                        {
+-                            _logger.LogWarning("{TurnCount} TURN servers configured but no relay candidates were gathered", turnServers.Count);
+-                        }
+-                        else if (relayCandidateCount < turnServers.Count)
+-                        {
+-                            _logger.LogWarning("{TurnCount} TURN servers configured but only {RelayCount} relay candidates were gathered", 
+-                                turnServers.Count, relayCandidateCount);
+-                        }
+-                        
+-                        if (isForceUseTurn && relayCandidateCount == 0)
+-                        {
+-                            _logger.LogError("Force-TURN mode is enabled but no relay candidates were gathered; ICE connection will fail");
+-                            _logger.LogError("Possible causes: wrong TURN URL/username/password, server unreachable, unsupported protocol, or insufficient wait time");
+-                            _logger.LogError("Configured TURN servers: {Count}", turnServers.Count);
+-                            foreach (var turn in turnServers)
+-                            {
+-                                _logger.LogError("   - URL: {Url}, Username: {Username}", 
+-                                    turn.Url, string.IsNullOrWhiteSpace(turn.Username) ? "none" : "set");
+-                            }
+-                        }
+-                    }
+-                }
+-                else if (isForceUseTurn && relayCandidateCount == 0)
+-                {
+-                    _logger.LogError("Force-TURN mode is enabled but ICE gathering completed with no relay candidates");
+-                }
+-                else if (isForceUseTurn && relayCandidateCount < turnServers.Count)
+-                {
+-                    _logger.LogWarning("Force-TURN mode: ICE gathering completed with only {RelayCount}/{TurnCount} relay candidates", 
+-                        relayCandidateCount, turnServers.Count);
+-                }
++                var startTime = System.Diagnostics.Stopwatch.StartNew();
++                // Completion is the actual gathering state; a bounded relay wait is
++                // not completion and must not be reported as such.
++                while (!iceGathering.IsComplete && startTime.ElapsedMilliseconds < waitTimeoutMs)
++                {
++                    if (hasTurnServers && startTime.ElapsedMilliseconds >= 2000 && iceGathering.RelayCount > 0)
++                        break;
++                    var remaining = waitTimeoutMs - (int)startTime.ElapsedMilliseconds;
++                    await Task.WhenAny(iceGathering.Completion, Task.Delay(Math.Max(1, Math.Min(500, remaining))));
++                }
++
++                if (!iceGathering.IsComplete)
++                {
++                    _logger.LogWarning("ICE gathering incomplete (waited {Elapsed}ms), collected {Count} candidates (host={Host}, srflx={Srflx}, relay={Relay})",
++                        startTime.ElapsedMilliseconds, iceGathering.CandidateCount, iceGathering.HostCount, iceGathering.SrflxCount, iceGathering.RelayCount);
++                }
++                if (isForceUseTurn && iceGathering.RelayCount == 0)
++                    _logger.LogError("Force-TURN mode is enabled but no relay candidates were gathered");
+ 
+                 var finalSdp = OptimizeSdpForLowLatency(peerConnection.localDescription.sdp.ToString());
+                 finalSdp = ApplyPublicIpToSdp(finalSdp, webrtcConfig.PublicIp);
+@@ -422,6 +306,8 @@
+                 {
+                     _logger.LogWarning("No m=audio line found in Answer SDP");
+                 }
++
++                _logger.LogInformation("Answer video summary: {VideoSummary}", AnswerVideoSummary.Create(answerSdp));
+ 
+                 var answer = new RTCSessionDescriptionInit
+                 {
+@@ -450,28 +336,6 @@
+                     {
+                         _logger.LogWarning(ex, "Failed to pre-initialize video pipeline: SessionId={SessionId}", sessionId);
+                     }
+-                    
+-                    session.PeerConnection.onicecandidate += (candidate) =>
+-                    {
+-                        if (candidate != null && candidate.candidate != null)
+-                        {
+-                            
+-                            var candidateWithUfrag = EnsureCandidateHasUfrag(candidate.candidate, session.PeerConnection);
+-                             
+-                             session.AddPendingIceCandidate(new RTCIceCandidateInit
+-                             {
+-                                 candidate = candidateWithUfrag,
+-                                 sdpMid = candidate.sdpMid,
+-                                 sdpMLineIndex = candidate.sdpMLineIndex
+-                             });
+-
+-                            try
+-                            {
+-                                session.PeerConnection.addLocalIceCandidate(candidate);
+-                            }
+-                            catch { }
+-                        }
+-                    };
+                     
+                     if (session.PeerConnection.iceGatheringState != RTCIceGatheringState.complete)
+                     {
+@@ -565,113 +429,6 @@
+                 {
+                     _logger.LogWarning("Setting Answer returned non-OK status: {SessionId}, Result: {Result}", sessionId, result);
+ 
+-                    if (result == SetDescriptionResultEnum.VideoIncompatible)
+-                    {
+-                        if (signalingState == RTCSignalingState.have_remote_pranswer ||
+-                            signalingState == RTCSignalingState.stable)
+-                        {
+-                            _logger.LogWarning("Video incompatible, but signaling state changed to {Signaling}; allowing connection to continue", signalingState);
+-                            return true;
+-                        }
+-                        else
+-                        {
+-                            _logger.LogError("Video incompatible and Answer was not applied, signaling state: {Signaling}", signalingState);
+-                            return true;
+-                        }
+-                    }
+-                    else if (result == SetDescriptionResultEnum.AudioIncompatible)
+-                    {
+-                        if (signalingState == RTCSignalingState.stable || signalingState == RTCSignalingState.have_remote_pranswer)
+-                        {
+-                            return true;
+-                        }
+-                        else
+-                        {
+-                            try
+-                            {
+-                                var remoteDesc = session.PeerConnection.remoteDescription;
+-                                if (remoteDesc != null && !string.IsNullOrWhiteSpace(remoteDesc.sdp?.ToString()))
+-                                {
+-                                    return true;
+-                                }
+-                                else
+-                                {
+-                                    var answerHasOpus = answerSdp.Contains("opus") || answerSdp.Contains("111");
+-                                    var answerHasTelephoneEvent = answerSdp.Contains("telephone-event") || answerSdp.Contains("101");
+-
+-                                    if (!answerHasOpus && answerHasTelephoneEvent)
+-                                    {
+-                                        _logger.LogError("Browser Answer contains only telephone-event, no Opus");
+-                                    }
+-
+-                                    try
+-                                    {
+-                                        var peerConnectionType = session.PeerConnection.GetType();
+-                                        var setRemoteDescMethods = peerConnectionType.GetMethods(System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)
+-                                            .Where(m => m.Name.Contains("Remote") && m.Name.Contains("Description"))
+-                                            .ToList();
+-
+-                                        foreach (var method in setRemoteDescMethods)
+-                                        {
+-                                            try
+-                                            {
+-                                                var parameters = method.GetParameters();
+-                                                if (parameters.Length == 1 && parameters[0].ParameterType == typeof(RTCSessionDescriptionInit))
+-                                                {
+-                                                    method.Invoke(session.PeerConnection, new object[] { answer });
+-                                                    var newRemoteDesc = session.PeerConnection.remoteDescription;
+-                                                    if (newRemoteDesc != null)
+-                                                    {
+-                                                        return true;
+-                                                    }
+-                                                }
+-                                            }
+-                                            catch { }
+-                                        }
+-
+-                                        var remoteDescProperty = peerConnectionType.GetProperty("remoteDescription",
+-                                            System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance);
+-                                        if (remoteDescProperty != null)
+-                                        {
+-                                            var setter = remoteDescProperty.GetSetMethod(true);
+-                                            if (setter != null)
+-                                            {
+-                                                setter.Invoke(session.PeerConnection, new object[] { answer });
+-                                                var newRemoteDesc = session.PeerConnection.remoteDescription;
+-                                                if (newRemoteDesc != null)
+-                                                {
+-                                                    return true;
+-                                                }
+-                                            }
+-                                        }
+-                                    }
+-                                    catch (Exception forceEx)
+-                                    {
+-                                        _logger.LogError(forceEx, "Failed to force-set remote description");
+-                                    }
+-
+-                                    try
+-                                    {
+-                                        var newOffer = session.PeerConnection.createOffer();
+-                                        if (newOffer != null)
+-                                        {
+-                                            await session.PeerConnection.setLocalDescription(newOffer);
+-                                            await Task.Delay(100);
+-                                        }
+-                                    }
+-                                    catch { }
+-
+-                                    return true;
+-                                }
+-                            }
+-                            catch (Exception ex)
+-                            {
+-                                _logger.LogError(ex, "Error checking remote description");
+-                                return true;
+-                            }
+-                        }
+-                    }
+-
+                     _logger.LogError("Failed to set Answer: {SessionId}, Result: {Result}", sessionId, result);
+                     return false;
+                 }
+--- a/RemotePlay/appsettings.json
++++ b/RemotePlay/appsettings.json
+@@ -12,18 +12,7 @@
+     "AllowAllOrigins": false,
+     "AllowedOrigins": []
+   },
+-  "Database": {
+-    "Host": "192.168.100.186",
+-    "Port": 36099,
+-    "Name": "remoteplay_dev",
+-    "User": "o1298098",
+-    "Password": "o1298098"
+-  },
+-  "ConnectionStrings": {
+-    "DB": ""
+-  },
+   "JWT": {
+-    "Secret": "YourSuperSecretKeyForJWTTokenGenerationMustBeAtLeast32Characters!",
+     "Issuer": "RemotePlay",
+     "Audience": "RemotePlayClient"
+   },

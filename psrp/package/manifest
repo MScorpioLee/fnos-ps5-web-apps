@@ -1,13 +1,13 @@
 appname=psrp-web
 version=0.1.0
 platform=x86
-display_name=PSRP Remote Play
-desc=Native PlayStation Remote Play web client; independent PostgreSQL and .NET 10; HTTPS gateway required.
+display_name=PS网页串流 (PS remote web)
+desc=PS remote web / PS网页串流, native PSRP component with independent PostgreSQL and .NET 10, HTTPS required.
 source=thirdparty
 maintainer=MScorpioLee
-maintainer_url=https://github.com/MScorpioLee/fnos-ps5-web-apps
+maintainer_url=https://github.com/MScorpioLee/ps-remote-web
 distributor=MScorpioLee
-distributor_url=https://github.com/MScorpioLee/fnos-ps5-web-apps
+distributor_url=https://github.com/MScorpioLee/ps-remote-web
 os_min_version=1.2.0
 desktop_uidir=ui
 desktop_applaunchname=psrp-web.main
