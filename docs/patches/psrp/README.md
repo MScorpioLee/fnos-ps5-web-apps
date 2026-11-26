@@ -7,7 +7,7 @@
 - 上游：<https://github.com/o1298098/remote-play>
 - 精确 commit：`24138d79f9fec10165d3dce9eebe95bc18ea5fa0`
 - GitHub codeload 归档 SHA256：`af6cdb40077e3065d32e10d0962e2598ed00fe3a39d0c835b32f55363712f02a`
-- `manifest.json` 固定归档 URL、三个 patch 的 SHA256、每层修改路径及最终 **446 个源码文件**的 SHA256。不是安装包、SDK、node_modules 或运行数据清单。
+- `manifest.json` 固定归档 URL、四个 patch 的 SHA256、每层修改路径及最终 **447 个源码文件**的 SHA256。不是安装包、SDK、node_modules 或运行数据清单。
 
 按序应用，不要把第 2 份历史累计 patch 当成相对干净上游的完整 diff：
 
@@ -15,7 +15,7 @@
 2. `0002-cumulative-lifecycle.patch`：该基线 → 历史累计 `source.patch` 的完整重放结果，包含租约、会话接管/回收、权限、输入授权、取消与媒体原子切换等累计后端及前端修复。导出时实际先重放旧 `source.patch`，按旧 source-changes 的全部 48 项 SHA256 核对；不是只取某轮 review-fix。
 3. `0003-latest-browser-controls.patch`：累计结果 → 当前前端；包含全屏按钮、统计诊断、键盘/实体手柄、触屏布局/多点触控、混合输入及测试，共 24 个变动文件。
 
-三层各为 31 / 48 / 24 个变动文件（存在跨层重叠，不是相加后的唯一文件数）。全部生产源码均与导出时被忽略的 `psrp/source` **字节一致**；没有修改工作副本的 streaming 源码。
+4. `0004-touch-overlay.patch`：画内半透明触屏手柄，显隐不改变视频位置和大小；修正窄屏、矮屏及全屏下的按键遮挡，包含浏览器布局回归测试。
 
 ### 仅测试工具的公开化处理
 
@@ -36,7 +36,7 @@ python3 docs/patches/psrp/verify-replay.py /tmp/psrp-restored-offline \
 
 脚本验证归档 SHA256、检查提取路径、逐层 `git apply --check` / `git apply`，再校验完整文件集合及每个 SHA256、上游 LICENSE。失败不生成目标副本。不会启动服务、触碰生产数据、连接 PS5、创建 Git commit 或上传文件。
 
-**干净 checkout 构建必须先恢复这些修补。** 现有 `psrp/build.sh` 只自动运行早期 `patch-source.py`，不会自动应用本目录三层 patch，不能声称直接运行旧 build.sh 就包含当前全部功能。确认 `psrp/source` 不存在后，可将上述恢复目标设为 `psrp/source`，再按 `psrp/README.md` 的环境/许可要求构建；不要在已有源码副本上重复应用这些 patch。包装/setup 正在独立审查，本目录没有更改该构建流程。
+**干净 checkout 构建必须先恢复这些修补。** 现有 `psrp/build.sh` 只自动运行早期 `patch-source.py`，不会自动应用本目录的完整补丁序列。确认 `psrp/source` 不存在后，可将上述恢复目标设为 `psrp/source`，再按 `psrp/README.md` 的环境/许可要求构建；不要在已有源码副本上重复应用这些 patch。
 
 可先在恢复的独立副本执行：
 

@@ -136,6 +136,19 @@
         "RemotePlay.Web/tests/touch-controller-service.cjs",
         "RemotePlay.Web/tests/touch-controls-harness.tsx"
       ]
+    },
+    {
+      "file": "0004-touch-overlay.patch",
+      "sha256": "b9112ec438e6ea88440e776f9c3faad859f28a73ea624ac967136fbacb154a8d",
+      "changed_files": [
+        "RemotePlay.Web/src/pages/streaming/components/StreamingDiagnosticsPanel.tsx",
+        "RemotePlay.Web/src/pages/streaming/components/StreamingFullscreenButton.tsx",
+        "RemotePlay.Web/src/pages/streaming/components/StreamingTopBar.tsx",
+        "RemotePlay.Web/src/pages/streaming/components/StreamingTouchControls.tsx",
+        "RemotePlay.Web/src/pages/streaming/components/touch-controller.css",
+        "RemotePlay.Web/src/pages/streaming/index.tsx",
+        "RemotePlay.Web/tests/browser_touch_overlay_test.py"
+      ]
     }
   ],
   "source_files": {
@@ -335,17 +348,17 @@
     "RemotePlay.Web/src/pages/streaming/components/MobileVirtualController.tsx": "ebf6cbc8ad9393341de0c4056d81c77287fa1b75ef6c4b4278ef84e95b27ced2",
     "RemotePlay.Web/src/pages/streaming/components/MobileVirtualControllerPortrait.tsx": "d64a4fd451b54bab2d1cd4576a17e7dcd71ec8225514311d3750267749e139dd",
     "RemotePlay.Web/src/pages/streaming/components/StreamingController.tsx": "a1371e735e4a0208ebca285888a730768f883e6d208097eaa1329f9ebada9e1f",
-    "RemotePlay.Web/src/pages/streaming/components/StreamingDiagnosticsPanel.tsx": "444142b363c2fc9eb65c8e58512071dce32c0aaca4403323277ac5851f23f397",
-    "RemotePlay.Web/src/pages/streaming/components/StreamingFullscreenButton.tsx": "95cc0be8f594f823b55694d7cfa1d5d0f58028f58d9cbfad158112a10f8c4c36",
+    "RemotePlay.Web/src/pages/streaming/components/StreamingDiagnosticsPanel.tsx": "e475a39a906e8191dcaa2291b0e22ba33a00f0960c469ee6bb86b88d476905f1",
+    "RemotePlay.Web/src/pages/streaming/components/StreamingFullscreenButton.tsx": "47fdc438ee77226319b1c25978188ce889287c1fa31b4786b3b96bfab0951aeb",
     "RemotePlay.Web/src/pages/streaming/components/StreamingHeader.tsx": "4294b050c300a6f9806d446624b176ae66516e118fa590dca20193cc92c0415d",
     "RemotePlay.Web/src/pages/streaming/components/StreamingLoading.tsx": "bf8b32b1c26fb03f2b11286dc66f80c6dca9b0061b6a591027610638b3820f66",
     "RemotePlay.Web/src/pages/streaming/components/StreamingStatsOverlay.tsx": "2537f1f1fd22a5284b33927579e61483615849cb8e2f0f3459d57a1dc4caecf6",
-    "RemotePlay.Web/src/pages/streaming/components/StreamingTopBar.tsx": "97d8afe48061d9dd74f6e43959af2ab4bb42191b1b337eb0ed53cdd433807124",
-    "RemotePlay.Web/src/pages/streaming/components/StreamingTouchControls.tsx": "a31e2c7920ec4cab16a91390c431d47dfa8c9712d52c2d23a79822af9f8f5a73",
+    "RemotePlay.Web/src/pages/streaming/components/StreamingTopBar.tsx": "e6add751445dc258d18e1393ec156fdc10ce709919b306e6ffd905eec9bfb9bd",
+    "RemotePlay.Web/src/pages/streaming/components/StreamingTouchControls.tsx": "ddc0a5b3e5a493b61ebb555e80f7fea90707c837efec105714ed0f6f6e0fb3df",
     "RemotePlay.Web/src/pages/streaming/components/StreamingVideoPlayer.tsx": "fb81a8a999fc4e59e3950c29d4982f84f2d5c814ec31d92645550732933ba5a6",
     "RemotePlay.Web/src/pages/streaming/components/TouchControllerSurface.tsx": "b08486c7afef86561b4384460b03fae517ec33d62546a3a5bad6c3e753f039e6",
-    "RemotePlay.Web/src/pages/streaming/components/touch-controller.css": "f34f42acbb343a8bbd3ddb8edcb2a04443cb0c9ee7878a711f5e2a2b276afb14",
-    "RemotePlay.Web/src/pages/streaming/index.tsx": "6e9a52a856aaecb101db1889bcc048ec18dea7e3e8178ab4017ad1e8154c0ed1",
+    "RemotePlay.Web/src/pages/streaming/components/touch-controller.css": "78354fc57dd9a7a28517cfa9e950fa20fe1660c996559eb8ca228a9114346b80",
+    "RemotePlay.Web/src/pages/streaming/index.tsx": "2a976037757a6e2d36b95ce7951f9a59973897b5a87c353a1981d6ce40a52769",
     "RemotePlay.Web/src/service/api-client.ts": "01240d89d25a6d59ca8abb31f698874adc44564d781a42a927c886ada94986b7",
     "RemotePlay.Web/src/service/auth.service.ts": "b6f73931328e5ed5634ae89dcd500b328f04d53859abf70875c5848c808e6041",
     "RemotePlay.Web/src/service/controller.service.ts": "d0c27b4960f84c61bbd4b16737697fcdc04937f4293ea1041919a0d049f09357",
@@ -391,6 +404,7 @@
     "RemotePlay.Web/tests/browser_sw_test.py": "d0e3acdf90dfbd66a74abd7caa94a754b84462b0f91ddeaa69ed5c3ebfbb0290",
     "RemotePlay.Web/tests/browser_touch_controls_test.py": "d5775b056312f171b8ab8d4b8a424a246d16c05ddd3dd557510be208461debed",
     "RemotePlay.Web/tests/browser_touch_geometry_test.py": "aa9599b4779fb3847e4b7d644138b415331e1556737da1656e592a15b456089e",
+    "RemotePlay.Web/tests/browser_touch_overlay_test.py": "2927243646c9757fe1ba42bd2f2ad9d390ab1b1aa4b78782c4dd1ddba76e6524",
     "RemotePlay.Web/tests/fullscreen-harness.tsx": "c5582f1d63b57387a546bd87ba795afc28568fabe778c67817f6d96d6ef4eaca",
     "RemotePlay.Web/tests/lifecycle-hook-harness.tsx": "ee49d7a22f3935b7d2bd8900be972cc8a9149665a75028b1aab018a8821f1058",
     "RemotePlay.Web/tests/streaming-diagnostics.test.mjs": "58f0868f6d208db451b7440f4d864a4dffa15060d90b653be3cc69be8c77df94",

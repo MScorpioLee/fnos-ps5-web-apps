@@ -1,0 +1,817 @@
+--- a/RemotePlay.Web/src/pages/streaming/components/StreamingDiagnosticsPanel.tsx
++++ b/RemotePlay.Web/src/pages/streaming/components/StreamingDiagnosticsPanel.tsx
+@@ -18,8 +18,10 @@
+   }, [])
+   const stale = !s || now - s.updatedAt > 6000 || hidden
+   const measured = stale ? null : s
+-  return <details aria-label="串流诊断" style={{ position: 'fixed', top: 54, left: 8, zIndex: 160, maxWidth: 'min(510px, calc(100vw - 16px))', maxHeight: 'calc(100dvh - 120px)', overflow: 'auto', padding: 8, borderRadius: 8, background: 'rgba(0,0,0,.85)', color: 'white', fontSize: 12, pointerEvents: 'auto' }}>
+-    <summary style={{ cursor: 'pointer' }}>实时串流诊断 · {bufferMode === 'low-latency' ? '低延迟（实验性）' : '自动'}{stale ? ' · 测量不可用' : ''}</summary>
++  return <details aria-label="串流诊断" className="fixed z-[10000] pointer-events-none text-white" style={{ top: 'max(8px, env(safe-area-inset-top))', right: 'max(8px, env(safe-area-inset-right))', maxWidth: 'min(510px, calc(100vw - max(8px, env(safe-area-inset-left)) - max(8px, env(safe-area-inset-right))))' }}>
++    <summary className="pointer-events-auto ml-auto flex min-h-[44px] w-max cursor-pointer select-none items-center gap-1 rounded-lg border border-white/60 bg-black/85 px-3 text-sm font-medium">串流诊断 <span aria-hidden="true">▾</span></summary>
++    <div className="pointer-events-auto mt-2 overflow-auto rounded-lg border border-white/60 bg-black/90 p-3 text-xs" style={{ maxHeight: 'calc(100dvh - max(8px, env(safe-area-inset-top)) - max(8px, env(safe-area-inset-bottom)) - 100px)' }}>
++    <p>模式：{bufferMode === 'low-latency' ? '低延迟（实验性）' : '自动'}{stale ? ' · 测量不可用' : ''}</p>
+     <p>目标（非实测）：1920×1080 / 60 FPS · 源采集 FPS：不可用</p>
+     <p>更新时间：{s ? `${Math.max(0, (now - s.updatedAt) / 1000).toFixed(1)} 秒前` : '不可用'} · {hidden ? '页面隐藏，测量不可用' : stale ? '无数据或已过期' : s?.intervalState === 'baseline' || s?.intervalState === 'reset' ? '首帧/重置，等待下一窗口' : '近期约 2 秒窗口'}</p>
+     <p>接收 receive FPS：{value(measured?.reportedReceiveFps)} · 解码 decode FPS：{value(measured?.decodeFps)} · 呈现 present FPS：{value(measured?.presentFps)}</p>
+@@ -35,5 +37,6 @@
+     </div>
+     <p>只对 video 设置受支持的浏览器提示，不保证零缓冲或降低总延迟；音频不变。不转码、不超分、不自动降分辨率。</p>
+     {bufferResults.map((r, i) => <p key={`${r.receiverIndex}-${r.property}-${i}`}>video #{r.receiverIndex} {r.property} ({r.unit})：{statuses[r.status]} · 读回 {r.readback === null ? 'null' : r.readback ?? '不可用'}</p>)}
++    </div>
+   </details>
+ }
+--- a/RemotePlay.Web/src/pages/streaming/components/StreamingFullscreenButton.tsx
++++ b/RemotePlay.Web/src/pages/streaming/components/StreamingFullscreenButton.tsx
+@@ -66,8 +66,8 @@
+       aria-pressed={active}
+       disabled={busy}
+       title={active ? '退出全屏（也可按 Esc）' : '全屏显示视频与控制界面'}
+-      className="fixed z-[10001] flex min-h-[44px] items-center gap-2 rounded-lg border border-white/60 bg-black/80 px-4 py-2 text-sm font-medium text-white shadow-lg hover:bg-black focus-visible:outline focus-visible:outline-2 focus-visible:outline-white"
+-      style={{ top: 'max(8px, env(safe-area-inset-top))', left: '50%', transform: 'translateX(-50%)', touchAction: 'manipulation' }}
++      className="streaming-fullscreen-toggle fixed z-[10001] flex min-h-[44px] items-center justify-center gap-2 rounded-lg border border-white/60 bg-black/80 px-4 py-2 text-sm font-medium text-white shadow-lg hover:bg-black focus-visible:outline focus-visible:outline-2 focus-visible:outline-white"
++      style={{ top: 'max(8px, env(safe-area-inset-top))', transform: 'translateX(-50%)', touchAction: 'manipulation' }}
+       onPointerDown={event => event.stopPropagation()}
+       onPointerUp={event => event.stopPropagation()}
+       onTouchStart={event => event.stopPropagation()}
+@@ -75,7 +75,7 @@
+       onClick={event => { event.stopPropagation(); void toggle() }}
+     >
+       {active ? <Minimize aria-hidden="true" size={18} /> : <Maximize aria-hidden="true" size={18} />}
+-      {active ? '退出全屏' : '全屏'}
++      <span className="streaming-fullscreen-label">{active ? '退出全屏' : '全屏'}</span>
+     </button>
+     {message && <div role="status" className="fixed z-[10001] rounded bg-black/90 p-3 text-sm text-white pointer-events-none" style={{ top: 'calc(max(8px, env(safe-area-inset-top)) + 52px)', left: '50%', transform: 'translateX(-50%)', width: 'max-content', maxWidth: '90vw' }}>{message}</div>}
+   </>
+--- a/RemotePlay.Web/src/pages/streaming/components/StreamingTopBar.tsx
++++ b/RemotePlay.Web/src/pages/streaming/components/StreamingTopBar.tsx
+@@ -1,8 +1,8 @@
+-import { useState, useRef, useEffect } from 'react'
++import { useState, useEffect } from 'react'
+ import { useTranslation } from 'react-i18next'
+-import { Button } from '@/components/ui/button'
+-import { ArrowLeft, Activity, ChevronUp, ChevronDown } from 'lucide-react'
++import { ArrowLeft, Activity, Menu } from 'lucide-react'
+ import { useDevice } from '@/hooks/use-device'
++import { hasTouchControls } from './StreamingTouchControls'
+ 
+ interface StreamingTopBarProps {
+   onBack: () => void
+@@ -10,239 +10,57 @@
+   onStatsToggle?: (enabled: boolean) => void
+ }
+ 
+-export function StreamingTopBar({
+-  onBack,
+-  isStatsEnabled = false,
+-  onStatsToggle,
+-}: StreamingTopBarProps) {
++const hudPosition = { left: 'max(8px, env(safe-area-inset-left))', top: 'max(8px, env(safe-area-inset-top))' }
++const hudButton = 'pointer-events-auto flex h-11 w-11 items-center justify-center rounded-lg border border-white/60 bg-black/85 text-white shadow-lg hover:bg-black'
++
++export function StreamingTopBar({ onBack, isStatsEnabled = false, onStatsToggle }: StreamingTopBarProps) {
+   const { t } = useTranslation()
+   const { isMobile } = useDevice()
+-  const [isVisible, setIsVisible] = useState(false)
+-  const [isMobileBarVisible, setIsMobileBarVisible] = useState(false)
+-  const timeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+-  const mouseMoveTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+-
+-  const showBar = () => {
+-    setIsVisible(true)
+-    // 清除所有隐藏定时器
+-    if (timeoutRef.current) {
+-      clearTimeout(timeoutRef.current)
+-      timeoutRef.current = null
+-    }
+-    if (mouseMoveTimeoutRef.current) {
+-      clearTimeout(mouseMoveTimeoutRef.current)
+-      mouseMoveTimeoutRef.current = null
+-    }
+-  }
+-
+-  const hideBar = () => {
+-    if (timeoutRef.current) {
+-      clearTimeout(timeoutRef.current)
+-    }
+-    // 延迟隐藏
+-    timeoutRef.current = setTimeout(() => {
+-      setIsVisible(false)
+-    }, 2000)
+-  }
++  const [isTouch, setIsTouch] = useState(hasTouchControls)
++  const [menuOpen, setMenuOpen] = useState(false)
++  const [mouseVisible, setMouseVisible] = useState(false)
++  const compact = isMobile || isTouch
+ 
+   useEffect(() => {
+-    // 移动端不显示顶部栏，桌面端根据鼠标移动显示
+-    if (isMobile) {
+-      return
++    const media = window.matchMedia('(any-pointer: coarse)')
++    const sync = () => setIsTouch(hasTouchControls())
++    media.addEventListener?.('change', sync)
++    return () => media.removeEventListener?.('change', sync)
++  }, [])
++  useEffect(() => {
++    if (compact) return
++    let timer: number | undefined
++    const show = () => {
++      setMouseVisible(true)
++      window.clearTimeout(timer)
++      timer = window.setTimeout(() => setMouseVisible(false), 3000)
+     }
++    window.addEventListener('mousemove', show, { passive: true })
++    return () => { window.removeEventListener('mousemove', show); window.clearTimeout(timer) }
++  }, [compact])
+ 
+-    let lastMouseMoveTime = Date.now()
++  const actions = <>
++    <button type="button" className={hudButton} onClick={onBack} aria-label={t('streaming.menu.back', '返回')}>
++      <ArrowLeft className="h-5 w-5" aria-hidden="true" />
++    </button>
++    {onStatsToggle && <button type="button" className={hudButton} aria-pressed={isStatsEnabled}
++      aria-label={isStatsEnabled ? t('streaming.monitor.disable', '关闭统计') : t('streaming.monitor.enable', '显示统计')}
++      onClick={() => { onStatsToggle(!isStatsEnabled); setMenuOpen(false) }}>
++      <Activity className="h-5 w-5" aria-hidden="true" />
++    </button>}
++  </>
+ 
+-    const handleMouseMove = () => {
+-      lastMouseMoveTime = Date.now()
+-      // 鼠标在任何位置移动时都显示按钮
+-      showBar()
+-    }
+-
+-    // 检测鼠标是否停止移动
+-    const checkMouseStop = () => {
+-      const timeSinceLastMove = Date.now() - lastMouseMoveTime
+-      // 如果鼠标3秒没有移动，隐藏按钮
+-      if (timeSinceLastMove > 3000 && isVisible) {
+-        setIsVisible(false)
+-      }
+-    }
+-
+-    // 立即添加鼠标移动监听
+-    window.addEventListener('mousemove', handleMouseMove, { passive: true })
+-    
+-    // 定期检查鼠标是否停止移动
+-    const mouseStopInterval = setInterval(checkMouseStop, 1000)
+-
+-    return () => {
+-      window.removeEventListener('mousemove', handleMouseMove)
+-      clearInterval(mouseStopInterval)
+-      if (timeoutRef.current) {
+-        clearTimeout(timeoutRef.current)
+-      }
+-      if (mouseMoveTimeoutRef.current) {
+-        clearTimeout(mouseMoveTimeoutRef.current)
+-      }
+-    }
+-  }, [isVisible, isMobile])
+-
+-  // 移动端：底部工具栏
+-  if (isMobile) {
+-    return (
+-      <>
+-        {/* 触发图标按钮 - 右下角，始终显示 */}
+-        <button
+-          onClick={(e) => {
+-            e.preventDefault()
+-            e.stopPropagation()
+-            setIsMobileBarVisible(!isMobileBarVisible)
+-          }}
+-          className="fixed z-[99] w-8 h-8 rounded-full bg-black/80 backdrop-blur-md border border-white/40 flex items-center justify-center text-white shadow-lg active:scale-90 transition-all pointer-events-auto"
+-          style={{
+-            touchAction: 'manipulation',
+-            right: '12px',
+-            bottom: isMobileBarVisible ? '64px' : '12px',
+-            WebkitTapHighlightColor: 'transparent',
+-          }}
+-          aria-label={isMobileBarVisible ? t('streaming.menu.hide', '隐藏菜单') : t('streaming.menu.show', '显示菜单')}
+-        >
+-          {isMobileBarVisible ? (
+-            <ChevronDown className="h-4 w-4" strokeWidth={2} />
+-          ) : (
+-            <ChevronUp className="h-4 w-4" strokeWidth={2} />
+-          )}
+-        </button>
+-
+-        {/* 底部工具栏 */}
+-        <div
+-          className={`fixed bottom-0 left-0 right-0 z-[99] pointer-events-auto transition-transform duration-300 ease-out ${
+-            isMobileBarVisible ? 'translate-y-0' : 'translate-y-full'
+-          }`}
+-        >
+-          <div className="bg-black/60 backdrop-blur-sm border-t border-white/20 px-4 py-2">
+-            <div className="flex items-center justify-center gap-6">
+-              {/* 返回按钮 */}
+-              <button
+-                onClick={onBack}
+-                className="flex items-center justify-center text-white/80 hover:text-white active:scale-95 transition-all"
+-                style={{
+-                  touchAction: 'manipulation',
+-                  width: '40px',
+-                  height: '40px',
+-                }}
+-                aria-label={t('streaming.menu.back', '返回')}
+-              >
+-                <ArrowLeft className="h-5 w-5" />
+-              </button>
+-
+-              {/* 统计开关 */}
+-              {onStatsToggle && (
+-                <button
+-                  onClick={() => onStatsToggle(!isStatsEnabled)}
+-                  className={`flex items-center justify-center active:scale-95 transition-all ${
+-                    isStatsEnabled ? 'text-white' : 'text-white/80 hover:text-white'
+-                  }`}
+-                  style={{
+-                    touchAction: 'manipulation',
+-                    width: '40px',
+-                    height: '40px',
+-                  }}
+-                  aria-label={
+-                    isStatsEnabled
+-                      ? t('streaming.monitor.disable', '关闭统计')
+-                      : t('streaming.monitor.enable', '显示统计')
+-                  }
+-                >
+-                  <Activity className="h-5 w-5" />
+-                </button>
+-              )}
+-            </div>
+-          </div>
+-        </div>
+-      </>
+-    )
+-  }
+-
+-  // 桌面端：保持原有顶部栏行为
+-  return (
+-    <div
+-      className="fixed top-0 left-0 right-0 z-[9999]"
+-      style={{ background: 'transparent' }}
+-      onMouseEnter={showBar}
+-      onMouseLeave={hideBar}
+-    >
+-      {/* 顶部检测区域 */}
+-      <div
+-        className="fixed top-0 left-0 right-0 h-24"
+-        onMouseEnter={showBar}
+-        style={{ pointerEvents: 'auto' }}
+-      />
+-      
+-      {/* 顶部栏内容 - 完全透明 */}
+-      <div
+-        className={`transition-all duration-300 ease-in-out ${
+-          isVisible
+-            ? 'opacity-100 translate-y-0'
+-            : 'opacity-0 -translate-y-full'
+-        }`}
+-        style={{
+-          pointerEvents: isVisible ? 'auto' : 'none',
+-        }}
+-      >
+-        <div className="px-6 py-4" style={{ background: 'transparent' }}>
+-          <div className="flex items-center justify-between gap-4">
+-            <Button
+-              variant="ghost"
+-              size="icon"
+-              onClick={onBack}
+-              className="text-white hover:text-white hover:bg-white/20 transition-all border-2 border-white/40 hover:border-white/60 bg-transparent backdrop-blur-none shadow-none rounded-full"
+-              style={{
+-                pointerEvents: 'auto',
+-                width: '48px',
+-                height: '48px',
+-                minWidth: '48px',
+-                minHeight: '48px',
+-                borderRadius: '50%',
+-                background: 'transparent',
+-              }}
+-            >
+-              <ArrowLeft className="h-6 w-6" />
+-            </Button>
+-
+-            <div className="flex items-center gap-2">
+-              {onStatsToggle && (
+-              <Button
+-                variant="ghost"
+-                size="icon"
+-                onClick={() => onStatsToggle(!isStatsEnabled)}
+-                className={`rounded-full shadow-none bg-transparent text-white hover:bg-transparent hover:text-white focus-visible:ring-0 focus-visible:ring-offset-0 ${
+-                  isStatsEnabled ? '' : 'opacity-80 hover:opacity-100'
+-                }`}
+-                style={{
+-                  pointerEvents: 'auto',
+-                  backdropFilter: 'none',
+-                  border: 'none',
+-                  backgroundColor: 'transparent',
+-                  boxShadow: 'none',
+-                }}
+-                aria-label={
+-                  isStatsEnabled
+-                    ? t('streaming.monitor.disable')
+-                    : t('streaming.monitor.enable')
+-                }
+-                title={
+-                  isStatsEnabled
+-                    ? t('streaming.monitor.disable')
+-                    : t('streaming.monitor.enable')
+-                }
+-              >
+-                <Activity className="h-5 w-5" />
+-              </Button>
+-              )}
+-            </div>
+-          </div>
+-        </div>
+-      </div>
++  if (compact) return <>
++    <button type="button" className={`fixed z-[170] ${hudButton}`} style={hudPosition}
++      aria-expanded={menuOpen} aria-controls="streaming-actions"
++      aria-label={menuOpen ? t('streaming.menu.hide', '隐藏菜单') : t('streaming.menu.show', '显示菜单')}
++      onClick={() => setMenuOpen(!menuOpen)}>
++      <Menu className="h-5 w-5" aria-hidden="true" />
++    </button>
++    <div id="streaming-actions" hidden={!menuOpen} className="fixed z-[170] left-[calc(max(8px,env(safe-area-inset-left))+48px)] top-[max(8px,env(safe-area-inset-top))]">
++      <div className="flex gap-1">{actions}</div>
+     </div>
+-  )
++  </>
++  return <div className="pointer-events-none fixed z-[170] flex gap-1"
++    style={{ ...hudPosition, visibility: mouseVisible ? 'visible' : 'hidden' }}>{actions}</div>
+ }
+--- a/RemotePlay.Web/src/pages/streaming/components/StreamingTouchControls.tsx
++++ b/RemotePlay.Web/src/pages/streaming/components/StreamingTouchControls.tsx
+@@ -1,4 +1,4 @@
+-import { useEffect, useState } from 'react'
++import { useEffect, useState, type CSSProperties, type RefObject } from 'react'
+ import { MobileVirtualController } from './MobileVirtualController'
+ import { MobileVirtualControllerPortrait } from './MobileVirtualControllerPortrait'
+ 
+@@ -6,10 +6,49 @@
+ export function hasTouchControls() {
+   return navigator.maxTouchPoints > 0 || window.matchMedia?.('(any-pointer: coarse)').matches === true
+ }
+-export function StreamingTouchControls({ sessionId, onVisibilityChange }: { sessionId: string | null; onVisibilityChange?: (visible: boolean) => void }) {
++
++/** Mirror the video player's centered object-fit: contain, not its element box. */
++function useImageInsets(videoRef?: RefObject<HTMLVideoElement>) {
++  const [insets, setInsets] = useState<CSSProperties>()
++  useEffect(() => {
++    const video = videoRef?.current
++    if (!video) return
++    const measure = () => {
++      const box = video.getBoundingClientRect()
++      // Use the stream's target ratio until metadata or the first track resize arrives.
++      const aspect = video.videoWidth && video.videoHeight ? video.videoWidth / video.videoHeight : 16 / 9
++      const width = Math.min(box.width, box.height * aspect)
++      const height = width / aspect
++      const left = box.left + (box.width - width) / 2
++      const top = box.top + (box.height - height) / 2
++      setInsets({
++        '--image-left': `${left}px`, '--image-right': `${window.innerWidth - left - width}px`,
++        '--image-top': `${top}px`, '--image-bottom': `${window.innerHeight - top - height}px`,
++      } as CSSProperties)
++    }
++    const observer = typeof ResizeObserver === 'undefined' ? undefined : new ResizeObserver(measure)
++    observer?.observe(video)
++    video.addEventListener('loadedmetadata', measure)
++    video.addEventListener('resize', measure)
++    video.addEventListener('emptied', measure)
++    window.addEventListener('resize', measure)
++    measure()
++    return () => {
++      observer?.disconnect()
++      video.removeEventListener('loadedmetadata', measure)
++      video.removeEventListener('resize', measure)
++      video.removeEventListener('emptied', measure)
++      window.removeEventListener('resize', measure)
++    }
++  }, [videoRef])
++  return insets
++}
++
++export function StreamingTouchControls({ sessionId, videoRef }: { sessionId: string | null; videoRef?: RefObject<HTMLVideoElement> }) {
+   const [preference, setPreference] = useState<boolean | null>(null)
+   const [touch, setTouch] = useState(hasTouchControls)
+   const [portrait, setPortrait] = useState(() => window.innerHeight > window.innerWidth)
++  const insets = useImageInsets(videoRef)
+   useEffect(() => {
+     const media = window.matchMedia('(any-pointer: coarse)')
+     const update = () => { setTouch(hasTouchControls()); setPortrait(window.innerHeight > window.innerWidth) }
+@@ -18,13 +57,13 @@
+     return () => { window.removeEventListener('resize', update); media.removeEventListener?.('change', update) }
+   }, [])
+   const visible = preference ?? touch
+-  useEffect(() => { onVisibilityChange?.(visible) }, [visible, onVisibilityChange])
++
+   const Layout = portrait ? MobileVirtualControllerPortrait : MobileVirtualController
+   return <>
+     <button type="button" aria-label={visible ? '隐藏触屏手柄' : '显示触屏手柄'} aria-pressed={visible}
+       className="fixed z-[170] rounded border border-white/60 bg-black/85 px-3 text-sm text-white"
+       style={{ left: 'max(8px, env(safe-area-inset-left))', bottom: 'max(8px, env(safe-area-inset-bottom))', minHeight: 44 }}
+       onClick={() => setPreference(!visible)}>{visible ? '隐藏触屏手柄' : '显示触屏手柄'}</button>
+-    {visible && <Layout sessionId={sessionId} isVisible />}
++    {visible && <div style={{ display: 'contents', ...insets }}><Layout sessionId={sessionId} isVisible /></div>}
+   </>
+ }
+--- a/RemotePlay.Web/src/pages/streaming/components/touch-controller.css
++++ b/RemotePlay.Web/src/pages/streaming/components/touch-controller.css
+@@ -1,26 +1,74 @@
+-.touch-controller { position:fixed; z-index:120; top:calc(max(8px, env(safe-area-inset-top)) + 100px); bottom:calc(max(8px, env(safe-area-inset-bottom)) + 64px); left:max(8px, env(safe-area-inset-left)); right:max(8px, env(safe-area-inset-right)); pointer-events:none; user-select:none; -webkit-user-select:none; }
+-.touch-controller-grid { height:100%; max-width:960px; margin:auto; display:grid; grid-template-columns:repeat(8,minmax(0,1fr)); grid-template-rows:repeat(6,minmax(0,1fr)); gap:2px; align-items:center; justify-items:center; }
+-.touch-key { pointer-events:auto; touch-action:none; width:clamp(36px,5.7vw,56px); height:min(100%,56px); min-height:30px; border:1px solid #ffffff90; border-radius:12px; background:#111a; display:flex; align-items:center; justify-content:center; color:white; }
+-.touch-key img { width:80%; height:80%; object-fit:contain; pointer-events:none; }
+-.touch-key[data-pressed=true] { background:#2563ebc0; border-color:white; }
+-.touch-L2 { grid-area:1/1/2/2 }.touch-L1 { grid-area:1/2/2/3 }.touch-R1 { grid-area:1/7/2/8 }.touch-R2 { grid-area:1/8/2/9 }
+-.touch-DPAD_UP { grid-area:2/2/3/3 }.touch-DPAD_LEFT { grid-area:3/1/4/2 }.touch-DPAD_RIGHT { grid-area:3/3/4/4 }.touch-DPAD_DOWN { grid-area:4/2/5/3 }
+-.touch-TRIANGLE { grid-area:2/7/3/8 }.touch-SQUARE { grid-area:3/6/4/7 }.touch-CIRCLE { grid-area:3/8/4/9 }.touch-CROSS { grid-area:4/7/5/8 }
+-.touch-SHARE { grid-area:6/3/7/4 }.touch-PS { grid-area:6/4/7/6 }.touch-OPTIONS { grid-area:6/6/7/7 }
+-.touch-L3 { grid-area:5/2/6/3 }.touch-R3 { grid-area:5/7/6/8 }
+-.touch-stick { pointer-events:auto; touch-action:none; width:min(100%,110px,calc((100dvh - 180px) * .4)); height:auto; aspect-ratio:1; border:2px solid #ffffff90; background:#1118; border-radius:50%; display:flex; align-items:center; justify-content:center; position:relative; color:white; }
++.streaming-fullscreen-toggle {
++  /* Three 44px menu slots, two 4px gaps, then clearance for the fullscreen button. */
++  left: max(50%, calc(max(8px, env(safe-area-inset-left)) + 196px));
++}
++@media (max-width: 440px) {
++  .streaming-fullscreen-toggle {
++    left: max(50%, calc(max(8px, env(safe-area-inset-left)) + 166px));
++    width: 44px; padding-inline: 0;
++  }
++  .streaming-fullscreen-label { display: none; } /* aria-label remains available */
++}
++
++.touch-controller {
++  position: fixed;
++  z-index: 120;
++  /* Intersect the displayed image with the safe area and the two HUD rails. */
++  top: max(calc(var(--image-top, 0px) + 4px), calc(max(8px, env(safe-area-inset-top)) + 54px));
++  bottom: max(calc(var(--image-bottom, 0px) + 4px), calc(max(8px, env(safe-area-inset-bottom)) + 65px));
++  left: max(calc(var(--image-left, 0px) + 4px), env(safe-area-inset-left));
++  right: max(calc(var(--image-right, 0px) + 4px), env(safe-area-inset-right));
++  pointer-events: none;
++  user-select: none;
++  -webkit-user-select: none;
++}
++.touch-controller-grid {
++  height: 100%; max-width: 960px; max-height: 380px; margin: auto;
++  display: grid; grid-template-columns: repeat(8, minmax(0, 1fr));
++  grid-template-rows: repeat(5, minmax(0, 1fr)); gap: 2px;
++  align-items: center; justify-items: center; container-type: size;
++}
++.touch-key, .touch-stick {
++  pointer-events: auto; touch-action: none; color: white;
++  border: 1px solid #ffffffb0; background: #0b122080;
++  display: flex; align-items: center; justify-content: center;
++}
++.touch-key { width: min(100%, 56px); height: min(100%, 52px); min-width: 0; min-height: 0; border-radius: 10px; font-size: 12px; }
++.touch-key img { width: 80%; height: 80%; object-fit: contain; pointer-events: none; }
++.touch-key[data-pressed=true] { background: #2563ebc0; border-color: white; }
++.touch-L2 { grid-area: 1/1/2/2 }.touch-L1 { grid-area: 1/2/2/3 }.touch-R1 { grid-area: 1/7/2/8 }.touch-R2 { grid-area: 1/8/2/9 }
++.touch-DPAD_UP { grid-area: 2/2/3/3 }.touch-DPAD_LEFT { grid-area: 3/1/4/2 }.touch-DPAD_RIGHT { grid-area: 3/3/4/4 }.touch-DPAD_DOWN { grid-area: 4/2/5/3 }
++.touch-TRIANGLE { grid-area: 2/7/3/8 }.touch-SQUARE { grid-area: 3/6/4/7 }.touch-CIRCLE { grid-area: 3/8/4/9 }.touch-CROSS { grid-area: 4/7/5/8 }
++.touch-SHARE { grid-area: 1/4/2/5 }.touch-PS { grid-area: 1/5/2/6 }.touch-OPTIONS { grid-area: 1/6/2/7 }
++.touch-L3 { grid-area: 5/2/6/3 }.touch-R3 { grid-area: 5/7/6/8 }
++.touch-stick {
++  width: min(100%, 64px); /* fallback for browsers without container units */
++  width: min(100%, 104px, calc(40cqh - 2px));
++  height: auto; aspect-ratio: 1; border-width: 2px; border-radius: 50%; position: relative;
++}
+ .touch-stick span { position:absolute; width:40%; height:40%; border-radius:50%; background:#ffffff70; transform:translate(var(--stick-x,0px),var(--stick-y,0px)); pointer-events:none; }
+-.touch-left { grid-area:4/3/6/5 }.touch-right { grid-area:4/5/6/7 }
+-.touch-limits { position:absolute; bottom:-20px; left:0; right:0; text-align:center; font-size:10px; color:#ddd; pointer-events:none; }
+-.touch-controller[data-touch-layout=portrait] { top:max(calc(100vw * 9 / 16 + 12px),calc(max(8px,env(safe-area-inset-top)) + 100px)); }
+-.touch-controller[data-touch-layout=portrait] .touch-left { grid-area:5/1/7/3 }
+-.touch-controller[data-touch-layout=portrait] .touch-right { grid-area:5/7/7/9 }
+-.touch-controller[data-touch-layout=portrait] .touch-L3 { grid-area:5/3/6/4 }
+-.touch-controller[data-touch-layout=portrait] .touch-R3 { grid-area:5/6/6/7 }
+-.touch-controller[data-touch-layout=landscape] .touch-controller-grid { grid-template-rows:repeat(5,minmax(0,1fr)); }
+-.touch-controller[data-touch-layout=landscape] .touch-SHARE { grid-area:1/4/2/5 }
+-.touch-controller[data-touch-layout=landscape] .touch-PS { grid-area:1/5/2/6 }
+-.touch-controller[data-touch-layout=landscape] .touch-OPTIONS { grid-area:1/6/2/7 }
+-/* Inspecting diagnostics temporarily parks touch input, rather than obscuring
+-   active controls. The toggle remains reachable to explicitly hide the layout. */
++.touch-left { grid-area: 4/3/6/5 }.touch-right { grid-area: 4/5/6/7 }
++
++@media (max-height: 240px) {
++  /* The bottom buttons are 44px high; keep a gap, not a second empty row. */
++  .touch-controller { bottom: max(calc(var(--image-bottom, 0px) + 4px), calc(max(8px, env(safe-area-inset-bottom)) + 48px)); }
++  /* Do not let the L3/R3 text line boxes extend into neighboring hit cells. */
++  .touch-key { overflow: hidden; line-height: 1; font-size: min(12px, 16cqh); }
++}
++@media (min-width: 720px) and (max-height: 240px) {
++  /* Wide and short: the bottom HUD is at the corners, not under this grid. */
++  .touch-controller {
++    left: max(calc(var(--image-left, 0px) + 4px), calc(max(8px, env(safe-area-inset-left)) + 148px));
++    right: max(calc(var(--image-right, 0px) + 4px), calc(max(8px, env(safe-area-inset-right)) + 148px));
++    bottom: max(calc(var(--image-bottom, 0px) + 4px), calc(env(safe-area-inset-bottom) + 4px));
++  }
++}
++
++.touch-limits {
++  position: fixed; bottom: calc(max(8px, env(safe-area-inset-bottom)) + 46px);
++  left: max(8px, env(safe-area-inset-left)); right: max(8px, env(safe-area-inset-right));
++  text-align: center; font-size: 10px; line-height: 14px; color: white; pointer-events: none;
++  text-shadow: 0 1px 3px black, 0 0 4px black;
++}
++/* Inspecting diagnostics temporarily parks touch input. */
+ .fullscreen-container:has(details[aria-label="串流诊断"][open]) .touch-controller { visibility:hidden; }
+--- a/RemotePlay.Web/src/pages/streaming/index.tsx
++++ b/RemotePlay.Web/src/pages/streaming/index.tsx
+@@ -1,4 +1,4 @@
+-import { useEffect, useMemo, useRef, useCallback, useState } from 'react'
++import { useEffect, useMemo, useRef, useCallback } from 'react'
+ import { useNavigate, useSearchParams } from 'react-router-dom'
+ import { useToast } from '@/hooks/use-toast'
+ import { Wifi, AlertTriangle } from 'lucide-react'
+@@ -9,7 +9,7 @@
+ import { StreamingLoading } from './components/StreamingLoading'
+ import { StreamingTopBar } from './components/StreamingTopBar'
+ import { StreamingStatsOverlay } from './components/StreamingStatsOverlay'
+-import { StreamingTouchControls, hasTouchControls } from './components/StreamingTouchControls'
++import { StreamingTouchControls } from './components/StreamingTouchControls'
+ import { MobileStatsBar } from './components/MobileStatsBar'
+ import { useStreamingConnection } from '../../hooks/use-streaming-connection'
+ import { useDevice } from '@/hooks/use-device'
+@@ -18,8 +18,7 @@
+   const navigate = useNavigate()
+   const [searchParams] = useSearchParams()
+   const { toast } = useToast()
+-  const { isMobile, isPortrait } = useDevice()
+-  const [showTouchLayout, setShowTouchLayout] = useState(hasTouchControls)
++  const { isMobile } = useDevice()
+ 
+   const hostId = searchParams.get('hostId')
+   const deviceName = searchParams.get('deviceName') || 'PlayStation'
+@@ -393,22 +392,7 @@
+       )}
+ 
+       {(isConnecting || isConnected) && (
+-        <div 
+-          className="fixed bg-black" 
+-          style={{ 
+-            zIndex: isConnected ? 10 : 0,
+-            // 竖屏模式下，视频宽度100%，高度按16:9比例；横屏模式下，占据全屏
+-            ...(showTouchLayout && isPortrait ? {
+-              top: 0,
+-              left: 0,
+-              right: 0,
+-              width: '100%',
+-              aspectRatio: '16/9',
+-            } : {
+-              inset: 0,
+-            }),
+-          }}
+-        >
++        <div className="fixed inset-0 bg-black" style={{ zIndex: isConnected ? 10 : 0 }}>
+           <StreamingVideoPlayer ref={videoRef} isConnected={isConnected} isConnecting={isConnecting} onConnect={connect} />
+         </div>
+       )}
+@@ -472,7 +456,7 @@
+         </div>
+       )}
+ 
+-      {isConnected && <StreamingTouchControls sessionId={webrtcSessionId} onVisibilityChange={setShowTouchLayout} />}
++      {isConnected && <StreamingTouchControls sessionId={webrtcSessionId} videoRef={videoRef} />}
+     </div>
+   )
+ }
+--- /dev/null
++++ b/RemotePlay.Web/tests/browser_touch_overlay_test.py
+@@ -0,0 +1,235 @@
++"""Full streaming page in Chromium; replace only remote connection/media transport."""
++import asyncio
++import json
++import os
++from pathlib import Path
++
++from playwright.async_api import async_playwright, expect
++
++BASE = os.environ.get('PSRP_FIXTURE_BASE', 'http://127.0.0.1:5197/app/psrp-web/')
++OUT = Path(os.environ['PSRP_SCREENSHOTS']) if 'PSRP_SCREENSHOTS' in os.environ else None
++HTML = '''<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
++<div id="root"></div><script type="module">
++import RefreshRuntime from './@react-refresh'; RefreshRuntime.injectIntoGlobalHook(window);
++window.$RefreshReg$=()=>{};window.$RefreshSig$=()=>type=>type;window.__vite_plugin_react_preamble_installed__=true;
++await import('./tests/fullscreen-harness.tsx');</script>'''
++STUB = '''export function useStreamingConnection() { return {
++  isConnected:true, isConnecting:false, connectionState:'connected', connect:()=>{},
++  disconnect:()=>window.actions.push('disconnect'), endRemoteSession:async()=>window.actions.push('end'),
++  connectionStats:{}, isStatsMonitoringEnabled:false, setStatsMonitoring:()=>window.actions.push('stats'),
++  webrtcSessionId:null, isStalling:false, bufferMode:'auto', bufferResults:[], chooseBufferMode:()=>{}
++} }'''
++PLAY = '''async ([width,height])=>{
++  const video=document.querySelector('video'), canvas=document.createElement('canvas');
++  canvas.width=width;canvas.height=height;
++  const ctx=canvas.getContext('2d');
++  const g=ctx.createLinearGradient(0,0,width,height);
++  g.addColorStop(0,'#017c88');g.addColorStop(1,'#602a99');
++  ctx.fillStyle=g;ctx.fillRect(0,0,width,height);
++  ctx.strokeStyle='#67e8f9';ctx.lineWidth=8;ctx.strokeRect(4,4,width-8,height-8);
++  ctx.textAlign='center';ctx.fillStyle='white';ctx.font='bold 32px sans-serif';
++  ctx.fillText('Synthetic game frame',width/2,height/2);
++  ctx.font='18px sans-serif';ctx.fillText(`${width} × ${height} · browser video fixture`,width/2,height/2+26);
++  clearInterval(window.fixtureTimer);
++  video.srcObject?.getTracks().forEach(track=>track.stop());
++  video.srcObject=canvas.captureStream(30);
++  window.fixtureTimer=setInterval(()=>ctx.fillRect(8,8,1,1),40);
++  await video.play();
++  await Promise.race([new Promise(resolve=>video.requestVideoFrameCallback(resolve)),
++    new Promise((_,reject)=>setTimeout(()=>reject(new Error('No video frame presented')),3000))]);
++  window.fixtureVideo ??= video;
++}'''
++MEASURE = '''()=>{
++  const v=document.querySelector('video'), b=v.getBoundingClientRect();
++  const box=r=>[r.left,r.top,r.width,r.height];
++  const scale=Math.min(b.width/v.videoWidth,b.height/v.videoHeight);
++  const w=v.videoWidth*scale,h=v.videoHeight*scale;
++  const measure=el=>{const r=el.getBoundingClientRect();
++    const x=r.left+r.width/2,y=r.top+r.height/2;
++    const target=document.elementFromPoint(x,y);
++    const owner=target?.closest('button, summary, [data-control]');
++    return {name:el.dataset.control||el.getAttribute('aria-label')||el.textContent.trim(),
++      rect:box(r),hit:el.contains(target),hitOwner:owner?.dataset.control||owner?.getAttribute('aria-label')||owner?.textContent.trim(),opacity:getComputedStyle(el).opacity};};
++  return {video:box(b),image:[b.left+(b.width-w)/2,b.top+(b.height-h)/2,w,h],
++    fit:getComputedStyle(v).objectFit,position:getComputedStyle(v).objectPosition,
++    intrinsic:[v.videoWidth,v.videoHeight],same:v===window.fixtureVideo,playing:!v.paused,
++    controls:[...document.querySelectorAll('[data-control]')].map(measure),
++    hud:[...document.querySelectorAll('details[aria-label="串流诊断"]>summary, button[aria-label$="全屏"], button[aria-label$="触屏手柄"], button[aria-controls="streaming-actions"], #streaming-actions button, .fullscreen-container>button:not([aria-label])')].filter(el=>el.checkVisibility()).map(measure)};
++}'''
++
++
++SETTLE = '()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)))'
++
++
++def contains(outer, inner, tolerance=1):
++    x,y,w,h = outer
++    a,b,c,d = inner
++    return a >= x-tolerance and b >= y-tolerance and a+c <= x+w+tolerance and b+d <= y+h+tolerance
++
++
++def overlaps(a, b):
++    return min(a[0]+a[2],b[0]+b[2])-max(a[0],b[0]) > .5 and min(a[1]+a[3],b[1]+b[3])-max(a[1],b[1]) > .5
++
++
++async def hit_cases(page, cases):
++    failures = []
++    menu = page.locator('button[aria-controls="streaming-actions"]')
++    surface = page.locator('[data-touch-layout]')
++    for width,height,iw,ih in cases:
++        await page.set_viewport_size({'width':width,'height':height})
++        await page.evaluate(PLAY, [iw,ih])
++        initial = await page.evaluate(MEASURE)
++        for fullscreen in (False, True):
++            if fullscreen:
++                await page.get_by_role('button',name='全屏',exact=True).tap()
++                await expect(page.get_by_role('button',name='退出全屏',exact=True)).to_be_enabled()
++                assert await page.evaluate('document.fullscreenElement?.classList.contains("fullscreen-container")')
++            # Match the reviewed state first, then check the other menu state as well.
++            for opened in ((False,True) if height==160 else (True,False)):
++                if opened:
++                    await menu.tap()
++                    await expect(menu).to_have_attribute('aria-expanded','true')
++                name = f'{width}x{height}-{iw}x{ih}-{"full" if fullscreen else "window"}-{"open" if opened else "closed"}'
++                await page.evaluate(SETTLE)
++                on = await page.evaluate(MEASURE)
++                await page.get_by_role('button',name='隐藏触屏手柄',exact=True).tap()
++                await expect(surface).to_have_count(0)
++                await page.evaluate(SETTLE)
++                off = await page.evaluate(MEASURE)
++                await page.get_by_role('button',name='显示触屏手柄',exact=True).tap()
++                await expect(surface).to_be_visible()
++                await page.evaluate(SETTLE)
++                again = await page.evaluate(MEASURE)
++                assert not off['controls']
++                assert all(s['same'] and s['playing'] and s['intrinsic']==[iw,ih] and
++                           s['image']==initial['image'] and s['video']==initial['video'] for s in (on,off,again)), name
++                assert len(on['controls']) == len(again['controls']) == 19
++                assert all(len(s['hud']) == (7 if opened else 5) for s in (on,off,again))
++                issues = set()
++                for s in (on,off,again):
++                    targets = s['controls'] + s['hud']
++                    for i,a in enumerate(targets):
++                        r = a['rect']
++                        if not a['hit']:
++                            issues.add(f'{a["name"]} center hit {a.get("hitOwner")}')
++                        game = a in s['controls']
++                        bounds = s['image'] if game else [0,0,width,height]
++                        minimum = 12 if game else 44
++                        if min(r[2:]) < minimum or not contains(bounds,r):
++                            issues.add(f'{a["name"]} outside bounds or too small: {r}')
++                        for b in targets[i+1:]:
++                            if overlaps(r,b['rect']):
++                                issues.add(f'{a["name"]} overlaps {b["name"]}')
++                if OUT:
++                    await page.screenshot(path=OUT/f'{name}.png', animations='disabled')
++                print(json.dumps({'case':name,'image':on['image'],'minGameSide':min(min(a['rect'][2:]) for a in on['controls']),
++                                  'issues':sorted(issues)},ensure_ascii=False),flush=True)
++                failures.extend((name,issue) for issue in issues)
++                if opened:
++                    await menu.tap()
++                    await expect(menu).to_have_attribute('aria-expanded','false')
++            if fullscreen:
++                await page.get_by_role('button',name='退出全屏',exact=True).tap()
++                await expect(page.get_by_role('button',name='全屏',exact=True)).to_be_enabled()
++                assert not await page.evaluate('!!document.fullscreenElement')
++    return failures
++
++
++async def main():
++    failures = []
++    async with async_playwright() as pw:
++        browser = await pw.chromium.launch(executable_path=os.environ.get('PSRP_CHROME'), args=['--no-sandbox'])
++        print('Chromium', browser.version, flush=True)
++        hit_only = os.environ.get('PSRP_HIT_CASES') == '1'
++        matrix = [(True, [(400,401,640,480),(320,200,640,360),(844,160,640,360)])] if hit_only else [
++            (True, [(390,844,640,360),(844,390,640,360),(320,568,640,360),(667,320,640,480)]),
++            (False, [(1280,720,640,360),(390,844,640,360)])]
++        for mobile, cases in matrix:
++            page = await browser.new_page(has_touch=True, is_mobile=mobile, user_agent=(
++                'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 Mobile/15E148 Safari/604.1' if mobile else None),
++                viewport={'width':cases[0][0], 'height':cases[0][1]}, service_workers='block')
++            errors, forbidden = [], []
++            page.set_default_timeout(5000)
++            page.on('pageerror', lambda err: errors.append(str(err)))
++            await page.add_init_script('window.actions=[]')
++            async def route(r):
++                url = r.request.url
++                if not url.startswith(BASE) or any(f'/{part}/' in url for part in ('api','hubs')):
++                    forbidden.append(url)
++                    await r.abort()
++                elif url.endswith('/overlay-test.html'):
++                    await r.fulfill(content_type='text/html', body=HTML)
++                elif '/src/hooks/use-streaming-connection' in url and url.split('?')[0].endswith(('use-streaming-connection','use-streaming-connection.ts')):
++                    await r.fulfill(content_type='text/javascript', body=STUB)
++                else:
++                    await r.continue_()
++            await page.route('**/*', route)
++            await page.goto(BASE+'overlay-test.html')
++            await page.locator('video').wait_for()
++            if hit_only:
++                failures.extend(await hit_cases(page, cases))
++                assert await page.evaluate('actions') == [], 'layout interactions must not alter the session'
++                assert not errors and not forbidden, (errors, forbidden)
++                await page.close()
++                continue
++            for width,height,iw,ih in cases:
++                await page.set_viewport_size({'width':width,'height':height})
++                await page.evaluate(PLAY, [iw,ih])
++                layout = page.locator('[data-touch-layout]')
++                await expect(layout).to_have_attribute('data-touch-layout','portrait' if height>width else 'landscape')
++                # Exercise desktop mouse-triggered HUD too.
++                if not mobile:
++                    await page.mouse.move(5, 5)
++                await page.evaluate(SETTLE)
++                on = await page.evaluate(MEASURE)
++                name = f'{"mobile" if mobile else "desktop-touch"}-{width}x{height}-{iw}x{ih}'
++                if OUT:
++                    await page.screenshot(path=OUT/f'{name}-on.png', animations='disabled')
++                await page.get_by_role('button',name='隐藏触屏手柄',exact=True).tap()
++                await expect(layout).to_have_count(0)
++                await page.evaluate(SETTLE)
++                off = await page.evaluate(MEASURE)
++                if OUT:
++                    await page.screenshot(path=OUT/f'{name}-off.png', animations='disabled')
++                await page.get_by_role('button',name='显示触屏手柄',exact=True).tap()
++                await expect(layout).to_be_visible()
++                again = await page.evaluate(MEASURE)
++                issues = []
++                for s in (on,off,again):
++                    if not (s['same'] and s['playing'] and s['intrinsic']==[iw,ih] and s['fit']=='contain' and s['position']=='50% 50%'):
++                        issues.append('video identity/playback/contain changed')
++                    if any(s[k]!=on[k] for k in ('video','image')):
++                        issues.append('touch toggle changed video/image rect')
++                    if len(s['hud']) not in ((5,) if mobile else (4, 5)):
++                        issues.append(f'unexpected HUD count: {s["hud"]}')
++                    for i, a in enumerate(s['hud']):
++                        if not (a['hit'] and float(a['opacity']) > 0 and a['rect'][2]>=36 and a['rect'][3]>=44 and contains([0,0,width,height],a['rect'])):
++                            issues.append(f'HUD not clear/reachable: {a}')
++                        if any(overlaps(a['rect'], b['rect']) for b in s['hud'][i+1:]):
++                            issues.append(f'HUD overlap: {a["name"]}')
++                assert len(on['controls']) == len(again['controls']) == 19
++                for s in (on,again):
++                    for i,a in enumerate(s['controls']):
++                        r = a['rect']
++                        if not (a['hit'] and r[2]>=27 and r[3]>=27 and contains(s['image'],r)):
++                            issues.append(f'control out of image, too small or obstructed: {a}')
++                        if any(overlaps(r,b['rect']) for b in s['controls'][i+1:]+s['hud']):
++                            issues.append(f'control overlap: {a["name"]}')
++                summary=page.locator('details[aria-label="串流诊断"] > summary')
++                if any(h['hit'] for h in again['hud'] if '串流诊断' in h['name']):
++                    await summary.tap()
++                    await expect(layout).to_be_hidden()
++                    await summary.tap()
++                    await expect(layout).to_be_visible()
++                print(json.dumps({'case':name,'on':on,'off':off,'issues':list(dict.fromkeys(issues))},ensure_ascii=False),flush=True)
++                failures.extend((name,issue) for issue in list(dict.fromkeys(issues)))
++            assert await page.evaluate('actions') == [], 'layout interactions must not disconnect or end the session'
++            assert not errors and not forbidden, (errors, forbidden)
++            await page.close()
++        await browser.close()
++    if failures:
++        raise AssertionError(f'{len(failures)} layout failures; see per-viewport browser report')
++
++
++if __name__ == '__main__':
++    asyncio.run(main())

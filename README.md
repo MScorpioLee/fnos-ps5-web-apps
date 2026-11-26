@@ -56,7 +56,7 @@
 
 每个目录提供自己的获取源码、修补、构建和打包入口；环境要求以该目录 README 为准。构建结束后才生成可安装包，不使用空白 WASM、伪造运行时或下载页替代运行产物。
 
-**PSRP 完整修改源码通过 [固定上游 + 三层可重放 patch](docs/patches/psrp/README.md) 保存**，包含累计后端 lifecycle、既有网络/解码修补与最新全屏、诊断、手柄/触屏功能。干净 checkout 必须先按该页恢复源码；旧 `build.sh` / `patch-source.py` 不会自动带入全部最新修补。恢复脚本校验完整源码文件 SHA256，不读取或发布生产数据。PSRP FPK 许可 HOLD 不变。
+**PSRP 完整修改源码通过 [固定上游 + 四层可重放 patch](docs/patches/psrp/README.md) 保存**，包含累计后端 lifecycle、既有网络/解码修补、全屏、诊断与画内触屏手柄。干净 checkout 必须先按该页恢复源码；旧 `build.sh` / `patch-source.py` 不会自动带入全部最新修补。恢复脚本校验完整源码文件 SHA256，不读取或发布生产数据。PSRP FPK 许可 HOLD 不变。
 
 通用源码检查：
 
